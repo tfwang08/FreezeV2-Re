@@ -97,9 +97,12 @@ Surface points are sampled with deterministic Poisson-disk spacing, matching the
 
 The camera-distance normalization is also an explicit reproduction choice because the paper specifies the final image occupancy but does not publish a unique focal-length/camera-distance pair.
 
+`pyrender` needs its OpenGL backend selected before it is imported. On a headless EGL machine, set `PYOPENGL_PLATFORM=egl` in the shell before running onboarding. Mesa/GLVND library paths remain machine-specific and are intentionally not hard-coded by this repository. This differs from the pinned BOP VisPy renderer, which sets `PYOPENGL_PLATFORM=egl` internally.
+
 For a first real stop-gate check on LM-O object 1:
 
 ```bash
+export PYOPENGL_PLATFORM=egl
 mkdir -p outputs/onboard/lmo_obj_000001/rgb
 
 python - <<'PY'
