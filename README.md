@@ -9,7 +9,7 @@ The codebase is intentionally small. There is no pose-specific training or fine-
 The `main` branch currently contains:
 
 - BOP reference/evaluation harness
-- deterministic CAD surface sampling
+- deterministic Poisson-disk CAD surface sampling
 - CNOS 162-view CAD onboarding cameras
 - 480x480 RGB/depth template rendering with explicit 50% frame fill
 - query-point visibility mapping and compressed onboarding cache
@@ -93,7 +93,9 @@ The untouched FreeZeV2.1 public submission should reproduce:
 
 FreeZeV2 renders 162 templates per object using the viewpoints proposed by CNOS. The implementation reproduces the CNOS 162-view icosphere geometry in NumPy and keeps the paper's render normalization explicit: square 480x480 renders with the projected model spanning approximately 50% of the frame.
 
-The 5k query cloud is sampled uniformly over triangle surface area. The camera-distance normalization is an explicit reproduction choice because the paper specifies the final image occupancy but does not publish a unique focal-length/camera-distance pair.
+Surface points are sampled with deterministic Poisson-disk spacing, matching the sampling property specified by the paper. The paper defines a raw point cloud `P_Q^raw`, retains only points visible in at least 18 rendered views, and reports 5k points for the final `P_Q`, but it does not publish `N_Q^raw`. Therefore Task 2 does not silently invent that raw count; the 5k sample below is a geometry/render smoke test. The final visibility filtering and feature aggregation are resolved when DINOv2 query features are added.
+
+The camera-distance normalization is also an explicit reproduction choice because the paper specifies the final image occupancy but does not publish a unique focal-length/camera-distance pair.
 
 For a first real stop-gate check on LM-O object 1:
 
