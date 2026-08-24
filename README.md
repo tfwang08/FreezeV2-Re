@@ -12,6 +12,8 @@ The `main` branch currently contains:
 - deterministic Poisson-disk CAD surface sampling
 - CNOS 162-view CAD onboarding cameras
 - 480x480 RGB/depth template rendering with explicit 50% frame fill
+- frozen DINOv2 intermediate-feature wrapper and FoundPose-style feature sampling
+- multi-view query visual-feature aggregation with visibility filtering
 - query-point visibility mapping and compressed onboarding cache
 - RGB-D backprojection
 - 16x16 sparse target sampling
@@ -22,12 +24,21 @@ The `main` branch currently contains:
 
 ## Install / test
 
+For the BOP/onboarding environment:
+
 ```bash
 pip install -e '.[data,onboard,test]'
 pytest -q
 ```
 
-The project explicitly restricts setuptools discovery to `freezev2*`, so an `external/` directory such as `external/bop_toolkit` does not become an accidental Python package.
+For the CUDA feature environment:
+
+```bash
+pip install -e '.[features,test]'
+pytest tests/test_features.py -q
+```
+
+The project explicitly restricts setuptools discovery to `freezev2*`, so an `external/` directory such as `external/bop_toolkit` or `external/dinov2` does not become an accidental Python package.
 
 ## Stage 1: prepare BOP data and reproduce the public score
 
@@ -144,6 +155,68 @@ templates: 162
 ```
 
 Before adding DINOv2, inspect the 162 RGB renders and verify the object is centered, fully visible, and approximately half-frame across viewpoints.
+
+## Stage 3: frozen DINOv2 visual features
+
+FreeZeV2 specifies ViT-giant DINOv2 patch features from intermediate layers "as proposed in FoundPose", but does not publish the ViT-g layer index. FoundPose's public LM-O representation config uses DINOv2 `vits14-reg`, `facet=token`, `layer=9`, normalization enabled, and stride 14. We therefore keep the ViT-g `layer` mandatory and explicit instead of presenting an inferred layer as a paper constant.
+
+To keep the DINO implementation reproducible, `DinoExtractor` pins the same DINOv2 source revision used as the FoundPose submodule:
+
+```text
+e1277af2ba9496fbadf7aec6eba56e8d882d1e35
+```
+
+The default backbone is the official `dinov2_vitg14`. Feature sampling follows FoundPose's exact image-coordinate convention: `grid_sample(..., align_corners=False)` after mapping `(x, y)` by `2 * point / (width, height) - 1`.
+
+For a stable local source checkout:
+
+```bash
+git clone https://github.com/facebookresearch/dinov2.git external/dinov2
+git -C external/dinov2 checkout e1277af2ba9496fbadf7aec6eba56e8d882d1e35
+```
+
+Then, in the CUDA `freeze` environment, run a one-template smoke test. `layer=30` below is only one explicit candidate for the 40-block ViT-g backbone; it is **not** claimed as the final FreeZeV2 layer.
+
+```bash
+python - <<'PY'
+import numpy as np
+import torch
+from PIL import Image
+from freezev2.features import DinoExtractor
+
+image = np.asarray(
+    Image.open("outputs/onboard/lmo_obj_000001/rgb/000.png").convert("RGB")
+)
+extractor = DinoExtractor(
+    device="cuda",
+    layer=30,
+    repo_or_dir="external/dinov2",
+)
+feature_map = extractor.encode(image)
+
+print("feature map:", tuple(feature_map.shape))
+print("dtype/device:", feature_map.dtype, feature_map.device)
+print("finite:", bool(torch.isfinite(feature_map).all()))
+print("frozen:", all(not p.requires_grad for p in extractor.model.parameters()))
+PY
+```
+
+For a 480x480 image with patch size/stride 14, the structural target is a finite `1536 x 34 x 34` feature map.
+
+The query aggregation API is:
+
+```python
+points, visual_features, view_counts = aggregate_query_visual_features(
+    query_points,
+    templates,
+    feature_maps,
+    depth_tolerance=...,
+    min_views=18,
+    view_weights=...,
+)
+```
+
+The paper states that per-view DINO features are combined with a weighted average but does not specify the weighting rule. `view_weights` is therefore explicit; `None` uses a uniform average only for smoke tests. The function returns the raw weighted visual mean. Following Eq. (1), PCA and L2 normalization are applied in the next fusion stage, not here.
 
 ## Seven BOP Classic-Core reference targets
 
