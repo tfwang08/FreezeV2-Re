@@ -2,7 +2,7 @@ name: BOP reference check
 
 on:
   push:
-    branches: [reproduce-bop]
+    branches: [main]
     paths:
       - ".github/workflows/bop-reference.yml"
       - "freezev2/bop.py"
