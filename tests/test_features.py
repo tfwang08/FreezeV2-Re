@@ -10,6 +10,7 @@ from freezev2.features import (
     DINOV2_FOUNDPOSE_COMMIT,
     DinoExtractor,
     aggregate_query_visual_features,
+    aggregate_query_visual_features_streaming,
     sample_feature_map,
 )
 from freezev2.onboard import CameraPose, Template
@@ -170,6 +171,42 @@ def test_query_visual_aggregation_ignores_cropped_image_border():
     np.testing.assert_allclose(points[0], [2.0, 2.0, 1.0])
     assert features.shape == (1, 2)
     assert counts.tolist() == [1]
+
+
+def test_streaming_query_aggregation_encodes_each_view_once():
+    query_points = np.array([[2.0, 2.0, 2.0]])
+    templates = [_template(), _template()]
+    feature_a = torch.zeros((2, 4, 4))
+    feature_b = torch.zeros((2, 4, 4))
+    feature_a[0] = 1.0
+    feature_b[1] = 1.0
+
+    class FakeExtractor:
+        def __init__(self):
+            self.maps = [feature_a, feature_b]
+            self.calls = 0
+            self.last_image_hw = None
+
+        def encode(self, image):
+            self.last_image_hw = image.shape[:2]
+            feature_map = self.maps[self.calls]
+            self.calls += 1
+            return feature_map
+
+    extractor = FakeExtractor()
+    points, features, counts = aggregate_query_visual_features_streaming(
+        query_points,
+        templates,
+        extractor,
+        depth_tolerance=1e-6,
+        min_views=2,
+        view_weights=np.array([[1.0], [3.0]]),
+    )
+
+    assert extractor.calls == 2
+    assert points.shape == (1, 3)
+    assert counts.tolist() == [2]
+    np.testing.assert_allclose(features[0], [0.25, 0.75], atol=1e-6)
 
 
 def test_foundpose_dinov2_commit_is_pinned():
