@@ -6,17 +6,23 @@ on:
     paths:
       - ".github/workflows/bop-reference.yml"
       - "freezev2/bop.py"
+      - "freezev2/geometry.py"
+      - "freezev2/onboard.py"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
+      - "tests/test_onboard.py"
   pull_request:
     branches: [main]
     paths:
       - ".github/workflows/bop-reference.yml"
       - "freezev2/bop.py"
+      - "freezev2/geometry.py"
+      - "freezev2/onboard.py"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
+      - "tests/test_onboard.py"
   workflow_dispatch:
 
 jobs:
@@ -36,10 +42,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl1-mesa-dev libgl1-mesa-dri libglx-mesa0 mesa-utils
 
-      - name: Install FreezeV2-Re and tests
+      - name: Install FreezeV2-Re and run tests
+        env:
+          PYOPENGL_PLATFORM: egl
+          EGL_PLATFORM: surfaceless
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[data,test]'
+          pip install -e '.[data,onboard,test]'
           pytest -q
 
       - name: Install pinned BOP Toolkit
