@@ -41,6 +41,13 @@ def test_query_sampling_is_exact_deterministic_and_on_surface():
     assert np.all(np.isclose(np.max(np.abs(a), axis=1), 1.0, atol=1e-10))
 
 
+def test_query_sampling_enforces_poisson_disk_spacing():
+    points = sample_query_points(cube_mesh(), n=300, seed=0)
+    distance = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    np.fill_diagonal(distance, np.inf)
+    assert float(distance.min()) > 0.15
+
+
 def test_template_camera_count_rotation_and_cnos_anchors():
     cams = make_template_cameras(n=162)
     assert len(cams) == 162
