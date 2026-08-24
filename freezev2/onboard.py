@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import math
+import tempfile
 
 import numpy as np
 
@@ -285,11 +286,27 @@ def fit_camera_to_mesh(mesh, camera: CameraPose, target_fill: float = 0.5) -> Ca
     return replace(camera, t=t)
 
 
-def _opencv_camera_to_world(camera: CameraPose) -> np.ndarray:
-    pose = np.eye(4, dtype=np.float64)
-    pose[:3, :3] = camera.R.T
-    pose[:3, 3] = -camera.R.T @ camera.t
-    return pose
+def _prepare_renderer_mesh(mesh):
+    """Return a trimesh, a PLY path for BOP Toolkit, and optional temp storage."""
+    try:
+        import trimesh
+    except ImportError as exc:
+        raise RuntimeError("Install onboarding dependencies with: pip install -e '.[onboard]'") from exc
+
+    if isinstance(mesh, (str, Path)):
+        path = Path(mesh)
+        return load_mesh(path), path, None
+
+    vertices, faces = _mesh_arrays(mesh)
+    if isinstance(mesh, trimesh.Trimesh):
+        tri_mesh = mesh
+    else:
+        tri_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    temp_dir = tempfile.TemporaryDirectory(prefix="freezev2-render-")
+    path = Path(temp_dir.name) / "mesh.ply"
+    tri_mesh.export(path)
+    return tri_mesh, path, temp_dir
 
 
 def render_templates(
@@ -298,25 +315,34 @@ def render_templates(
     size: int = 480,
     target_fill: float = 0.5,
 ) -> list[Template]:
-    """Render RGB/depth templates with pyrender, using CNOS viewpoints."""
+    """Render RGB/depth templates with the official BOP VisPy renderer.
+
+    BOP's VisPy backend uses the same headless EGL path as the Stage-1 evaluator
+    and accepts OpenCV-style ``R/t/K`` directly. This avoids pyrender's EGL
+    device enumeration, which is incompatible with software Mesa/llvmpipe on
+    machines where ``eglQueryDevicesEXT`` reports no devices.
+    """
     try:
-        import pyrender
-        import trimesh
+        from bop_toolkit_lib.rendering import renderer as bop_renderer
     except ImportError as exc:
-        raise RuntimeError("Install onboarding dependencies with: pip install -e '.[onboard]'") from exc
+        raise RuntimeError(
+            "Install the pinned BOP Toolkit before rendering CAD templates"
+        ) from exc
 
-    if isinstance(mesh, (str, Path)):
-        mesh = load_mesh(mesh)
-    vertices, _ = _mesh_arrays(mesh)
-    if not isinstance(mesh, trimesh.Trimesh):
-        mesh = trimesh.Trimesh(vertices=vertices, faces=np.asarray(mesh.faces), process=False)
-
-    render_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
-    scene = pyrender.Scene(bg_color=np.zeros(4), ambient_light=np.array([0.02, 0.02, 0.02, 1.0]))
-    scene.add(render_mesh)
-    renderer = pyrender.OffscreenRenderer(viewport_width=int(size), viewport_height=int(size))
+    mesh_obj, mesh_path, temp_dir = _prepare_renderer_mesh(mesh)
+    renderer = bop_renderer.create_renderer(
+        int(size),
+        int(size),
+        renderer_type="vispy",
+        mode="rgb+depth",
+        shading="flat",
+        bg_color=(0.0, 0.0, 0.0, 0.0),
+    )
+    obj_id = 1
+    renderer.set_light_cam_pos((0.0, 0.0, 0.0))
+    renderer.set_light_ambient_weight(0.02)
+    renderer.add_object(obj_id, str(mesh_path))
     templates: list[Template] = []
-    cv_to_gl = np.diag([1.0, -1.0, -1.0, 1.0])
 
     try:
         for base_camera in cameras:
@@ -327,34 +353,27 @@ def render_templates(
                 K[1, :] *= scale
                 K[2, :] = [0.0, 0.0, 1.0]
                 base_camera = replace(base_camera, K=K, size=int(size))
-            camera = fit_camera_to_mesh(mesh, base_camera, target_fill=target_fill)
-            c2w_gl = _opencv_camera_to_world(camera) @ cv_to_gl
 
-            center = 0.5 * (vertices.min(axis=0) + vertices.max(axis=0))
-            camera_position = -camera.R.T @ camera.t
-            distance = float(np.linalg.norm(camera_position - center))
-            radius = float(np.max(np.linalg.norm(vertices - center, axis=1)))
-            near = max(1e-4, distance - 2.0 * radius)
-            far = distance + 2.0 * radius
-            pyr_camera = pyrender.IntrinsicsCamera(
-                fx=camera.K[0, 0], fy=camera.K[1, 1],
-                cx=camera.K[0, 2], cy=camera.K[1, 2],
-                znear=near, zfar=far,
+            camera = fit_camera_to_mesh(mesh_obj, base_camera, target_fill=target_fill)
+            output = renderer.render_object(
+                obj_id=obj_id,
+                R=np.asarray(camera.R, dtype=np.float64),
+                t=np.asarray(camera.t, dtype=np.float64).reshape(3, 1),
+                fx=float(camera.K[0, 0]),
+                fy=float(camera.K[1, 1]),
+                cx=float(camera.K[0, 2]),
+                cy=float(camera.K[1, 2]),
             )
-            cam_node = scene.add(pyr_camera, pose=c2w_gl)
-            light = pyrender.SpotLight(
-                color=np.ones(3), intensity=0.6,
-                innerConeAngle=np.pi / 16.0, outerConeAngle=np.pi / 6.0,
+            rgb = np.asarray(output["rgb"], dtype=np.uint8)
+            depth = np.asarray(output["depth"], dtype=np.float32)
+            templates.append(
+                Template(rgb=rgb, depth=depth, mask=depth > 0, camera=camera)
             )
-            light_node = scene.add(light, pose=c2w_gl)
-            color, depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-            scene.remove_node(cam_node)
-            scene.remove_node(light_node)
-            rgb = np.asarray(color[..., :3], dtype=np.uint8)
-            depth = np.asarray(depth, dtype=np.float32)
-            templates.append(Template(rgb=rgb, depth=depth, mask=depth > 0, camera=camera))
     finally:
-        renderer.delete()
+        renderer.remove_object(obj_id)
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
     return templates
 
 
