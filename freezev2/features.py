@@ -135,6 +135,7 @@ class DinoExtractor:
 
         self.patch_size = _pair(self.model.patch_embed.patch_size)
         self.stride = _pair(self.model.patch_embed.proj.stride)
+        self.last_image_hw: tuple[int, int] | None = None
         self.mean = torch.tensor(
             [0.485, 0.456, 0.406],
             dtype=torch.float32,
@@ -146,9 +147,24 @@ class DinoExtractor:
             device=self.device,
         ).view(1, 3, 1, 1)
 
+    def compatible_image_hw(self, image_hw: tuple[int, int]) -> tuple[int, int]:
+        """Return the top-left crop size accepted by the DINO patch embedder."""
+        image_h, image_w = map(int, image_hw)
+        patch_h, patch_w = self.patch_size
+        crop_h = image_h - image_h % patch_h
+        crop_w = image_w - image_w % patch_w
+        if crop_h <= 0 or crop_w <= 0:
+            raise ValueError("image is smaller than the DINO patch size")
+        return crop_h, crop_w
+
     def _prepare_image(self, image):
         torch = _torch()
-        tensor = torch.as_tensor(image, device=self.device)
+        if isinstance(image, np.ndarray):
+            # PIL -> np.asarray can be read-only; copy avoids PyTorch's warning and
+            # keeps tensor creation independent of the source buffer lifetime.
+            tensor = torch.as_tensor(np.array(image, copy=True), device=self.device)
+        else:
+            tensor = torch.as_tensor(image, device=self.device)
         if tensor.ndim != 3:
             raise ValueError("image must have shape HxWx3 or 3xHxW")
         if tensor.shape[-1] == 3:
@@ -164,10 +180,19 @@ class DinoExtractor:
                 float(tensor.min()) < 0.0 or float(tensor.max()) > 1.0
             ):
                 raise ValueError("floating-point image values must be in [0, 1]")
+
+        crop_h, crop_w = self.compatible_image_hw(tuple(tensor.shape[-2:]))
+        tensor = tensor[:, :crop_h, :crop_w]
+        self.last_image_hw = (crop_h, crop_w)
         return tensor.unsqueeze(0)
 
     def encode(self, image):
-        """Return one intermediate DINO patch feature map as CxHf xWf."""
+        """Return one intermediate DINO patch feature map as CxHf xWf.
+
+        If the rendered image is not divisible by the patch size, only the
+        bottom/right remainder is dropped. For ViT-g/14, a 480x480 FreeZeV2
+        render therefore becomes 476x476 and produces a 34x34 patch grid.
+        """
         torch = _torch()
         batch = self._prepare_image(image)
         captured = []
@@ -232,6 +257,7 @@ def aggregate_query_visual_features(
     depth_tolerance: float,
     min_views: int = 18,
     view_weights=None,
+    feature_image_hws: Sequence[tuple[int, int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Aggregate rendered DINO observations onto query surface points.
 
@@ -241,12 +267,19 @@ def aggregate_query_visual_features(
     uniform averaging and is intended for smoke tests until that missing detail
     is resolved. Raw visual means are returned here; Eq. (1) applies PCA and
     L2-normalization later during visual/geometric fusion.
+
+    ``feature_image_hws`` records the actual image area seen by DINO. It matters
+    for paper-style 480x480 renders because ViT-g/14 consumes the top-left
+    476x476 crop; projected points in the dropped four-pixel border must not be
+    counted as visual observations.
     """
     query_points = np.asarray(query_points, dtype=np.float64)
     if query_points.ndim != 2 or query_points.shape[1] != 3:
         raise ValueError("query_points must have shape Nx3")
     if len(templates) != len(feature_maps):
         raise ValueError("templates and feature_maps must have the same length")
+    if feature_image_hws is not None and len(feature_image_hws) != len(feature_maps):
+        raise ValueError("feature_image_hws must contain one size per feature map")
     if min_views <= 0:
         raise ValueError("min_views must be positive")
     if depth_tolerance < 0:
@@ -279,10 +312,28 @@ def aggregate_query_visual_features(
         )
         if len(ids) == 0:
             continue
+
+        image_hw = (
+            tuple(map(int, template.depth.shape[:2]))
+            if feature_image_hws is None
+            else tuple(map(int, feature_image_hws[view_id]))
+        )
+        image_h, image_w = image_hw
+        inside = (
+            (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < image_w)
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < image_h)
+        )
+        ids = ids[inside]
+        pixels = pixels[inside]
+        if len(ids) == 0:
+            continue
+
         sampled = sample_feature_map(
             feature_map,
             pixels,
-            image_hw=template.depth.shape[:2],
+            image_hw=image_hw,
         )
         sampled_np = sampled.detach().to("cpu").numpy().astype(np.float64, copy=False)
         point_weights = weights[view_id, ids]
