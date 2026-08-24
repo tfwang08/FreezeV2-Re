@@ -60,6 +60,7 @@ jobs:
           EGL_PLATFORM: surfaceless
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
+          set -o pipefail
           python run_bop.py evaluate-reference \
             --dataset lmo \
             --bop-root data/bop \
