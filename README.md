@@ -86,7 +86,7 @@ python run_bop.py evaluate-reference \
   --eval-root outputs/bop_eval
 ```
 
-`run_bop.py` calls `scripts/eval_bop19_pose.py` from the pinned BOP Toolkit. It does not reimplement VSD/MSSD/MSPD.
+`run_bop.py` calls `scripts/eval_bop19_pose.py` from the pinned BOP Toolkit. It does not reimplement BOP metrics.
 
 ### LM-O reference target
 
@@ -168,6 +168,8 @@ e1277af2ba9496fbadf7aec6eba56e8d882d1e35
 
 The default backbone is the official `dinov2_vitg14`. Feature sampling follows FoundPose's exact image-coordinate convention: `grid_sample(..., align_corners=False)` after mapping `(x, y)` by `2 * point / (width, height) - 1`.
 
+The paper explicitly renders 480x480 templates, while ViT-g/14 requires patch-aligned input dimensions. `DinoExtractor` keeps the paper's 480x480 render unchanged on disk and drops only the bottom/right remainder before DINO inference. Therefore a 480x480 template is consumed as 476x476 (`34 * 14`) and produces a 34x34 feature grid. This follows DINOv2's documented closest-smaller-multiple behavior rather than changing the paper's render resolution. The actual DINO crop size is exposed as `extractor.last_image_hw` / `extractor.compatible_image_hw(...)`, and points in the dropped border are excluded during multi-view aggregation.
+
 For a stable local source checkout:
 
 ```bash
@@ -194,6 +196,7 @@ extractor = DinoExtractor(
 )
 feature_map = extractor.encode(image)
 
+print("DINO image hw:", extractor.last_image_hw)
 print("feature map:", tuple(feature_map.shape))
 print("dtype/device:", feature_map.dtype, feature_map.device)
 print("finite:", bool(torch.isfinite(feature_map).all()))
@@ -201,11 +204,22 @@ print("frozen:", all(not p.requires_grad for p in extractor.model.parameters()))
 PY
 ```
 
-For a 480x480 image with patch size/stride 14, the structural target is a finite `1536 x 34 x 34` feature map.
+The structural target is:
+
+```text
+DINO image hw: (476, 476)
+feature map: (1536, 34, 34)
+finite: True
+frozen: True
+```
 
 The query aggregation API is:
 
 ```python
+feature_image_hws = [
+    extractor.compatible_image_hw(template.depth.shape[:2])
+    for template in templates
+]
 points, visual_features, view_counts = aggregate_query_visual_features(
     query_points,
     templates,
@@ -213,6 +227,7 @@ points, visual_features, view_counts = aggregate_query_visual_features(
     depth_tolerance=...,
     min_views=18,
     view_weights=...,
+    feature_image_hws=feature_image_hws,
 )
 ```
 
