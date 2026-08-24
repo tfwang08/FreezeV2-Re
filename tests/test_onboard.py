@@ -6,6 +6,7 @@ import pytest
 
 from freezev2.onboard import (
     fit_camera_to_mesh,
+    load_onboarding_templates,
     make_template_cameras,
     map_visible_pixels_to_query_points,
     render_templates,
@@ -107,6 +108,37 @@ def test_onboarding_cache_round_trip(tmp_path):
     assert data["camera_t"].shape == (3, 3)
     assert data["camera_K"].shape == (3, 3, 3)
     assert float(data["diameter"]) == 3.0
+
+
+def test_onboarding_cache_can_reload_rgb_depth_and_cameras(tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+    query = sample_query_points(cube_mesh(), n=8, seed=2)
+    cameras = make_template_cameras(162, size=4)[:2]
+    depths = np.zeros((2, 4, 4), dtype=np.float32)
+    depths[0, 1:3, 1:3] = 2.0
+    depths[1, 1:3, 1:3] = 3.0
+
+    cache = save_onboarding_cache(
+        tmp_path / "onboarding.npz",
+        query,
+        cameras,
+        template_depth=depths,
+    )
+    rgb_dir = tmp_path / "rgb"
+    rgb_dir.mkdir()
+    Image.fromarray(np.full((4, 4, 3), 10, dtype=np.uint8)).save(rgb_dir / "000.png")
+    Image.fromarray(np.full((4, 4, 3), 20, dtype=np.uint8)).save(rgb_dir / "001.png")
+
+    templates = load_onboarding_templates(cache, rgb_dir)
+
+    assert len(templates) == 2
+    assert templates[0].rgb[0, 0, 0] == 10
+    assert templates[1].rgb[0, 0, 0] == 20
+    np.testing.assert_allclose(templates[0].depth, depths[0])
+    np.testing.assert_allclose(templates[1].depth, depths[1])
+    np.testing.assert_allclose(templates[1].camera.R, cameras[1].R)
+    np.testing.assert_allclose(templates[1].camera.t, cameras[1].t)
+    assert templates[1].camera.size == 4
 
 
 def test_render_templates_uses_bop_vispy_backend(tmp_path, monkeypatch):
