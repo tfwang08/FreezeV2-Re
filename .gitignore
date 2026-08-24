@@ -1,0 +1,16 @@
+# External assets
+/data/
+/weights/
+/cache/
+/external/
+/outputs/
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
