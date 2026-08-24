@@ -6,7 +6,7 @@ The codebase is intentionally small. There is no pose-specific training or fine-
 
 ## Current baseline
 
-The `reproduce-bop` branch currently contains the geometry/matching core needed after feature extraction:
+The `main` branch currently contains the geometry/matching core needed after feature extraction:
 
 - RGB-D backprojection
 - 16x16 sparse target sampling
@@ -61,10 +61,10 @@ The result CSV is external benchmark data and is ignored by git.
 
 ### 4. Run the official BOP19 localization evaluator
 
-For a headless CUDA/Linux machine:
+Configure the OpenGL/EGL renderer for the current machine before running the evaluator. `FreezeV2-Re` intentionally does not inject renderer-specific environment variables; it only sets `BOP_PATH` and otherwise inherits the caller environment. The GitHub Actions workflow configures software Mesa explicitly for its headless runner.
 
 ```bash
-PYOPENGL_PLATFORM=egl python run_bop.py evaluate-reference \
+python run_bop.py evaluate-reference \
   --dataset lmo \
   --bop-root data/bop \
   --bop-toolkit external/bop_toolkit \
