@@ -52,7 +52,10 @@ class FakeDino(nn.Module):
         self.scale = nn.Parameter(torch.ones(()))
 
     def forward(self, x):
-        h, w = x.shape[-2] // 2, x.shape[-1] // 2
+        patch_h, patch_w = self.patch_embed.patch_size
+        assert x.shape[-2] % patch_h == 0
+        assert x.shape[-1] % patch_w == 0
+        h, w = x.shape[-2] // patch_h, x.shape[-1] // patch_w
         patch_tokens = torch.zeros((x.shape[0], h * w, 3), device=x.device)
         cls_token = torch.zeros((x.shape[0], 1, 3), device=x.device)
         tokens = torch.cat([cls_token, patch_tokens], dim=1)
@@ -71,6 +74,16 @@ def test_dino_extractor_is_frozen_and_returns_intermediate_patch_map():
     assert extractor.model.training is False
     assert all(not p.requires_grad for p in extractor.model.parameters())
     assert torch.allclose(feature_map, torch.ones_like(feature_map))
+
+
+def test_dino_extractor_crops_to_nearest_smaller_patch_multiple():
+    extractor = DinoExtractor(device="cpu", layer=0, model=FakeDino())
+    image = np.zeros((5, 5, 3), dtype=np.uint8)
+
+    feature_map = extractor.encode(image)
+
+    assert feature_map.shape == (3, 2, 2)
+    assert extractor.last_image_hw == (4, 4)
 
 
 def _template(depth_value=2.0):
@@ -122,6 +135,41 @@ def test_query_visual_aggregation_filters_visibility_and_supports_weights():
     assert points.shape == (0, 3)
     assert features.shape == (0, 2)
     assert counts.shape == (0,)
+
+
+def test_query_visual_aggregation_ignores_cropped_image_border():
+    camera = CameraPose(
+        R=np.eye(3),
+        t=np.zeros(3),
+        K=np.eye(3),
+        size=5,
+        direction=np.array([0.0, 0.0, 1.0]),
+    )
+    depth = np.zeros((5, 5), dtype=np.float32)
+    depth[2, 2] = 1.0
+    depth[4, 4] = 1.0
+    template = Template(
+        rgb=np.zeros((5, 5, 3), dtype=np.uint8),
+        depth=depth,
+        mask=depth > 0,
+        camera=camera,
+    )
+    query_points = np.array([[2.0, 2.0, 1.0], [4.0, 4.0, 1.0]])
+    feature_map = torch.ones((2, 2, 2))
+
+    points, features, counts = aggregate_query_visual_features(
+        query_points,
+        [template],
+        [feature_map],
+        depth_tolerance=1e-6,
+        min_views=1,
+        feature_image_hws=[(4, 4)],
+    )
+
+    assert points.shape == (1, 3)
+    np.testing.assert_allclose(points[0], [2.0, 2.0, 1.0])
+    assert features.shape == (1, 2)
+    assert counts.tolist() == [1]
 
 
 def test_foundpose_dinov2_commit_is_pinned():
