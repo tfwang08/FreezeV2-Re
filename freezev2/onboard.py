@@ -57,11 +57,12 @@ def load_mesh(path: str | Path):
     return mesh
 
 
-def sample_query_points(mesh, n: int = 5000, seed: int = 0) -> np.ndarray:
-    """Deterministically sample points uniformly over triangle surface area."""
-    if n <= 0:
-        raise ValueError("n must be positive")
-    vertices, faces = _mesh_arrays(mesh)
+def _uniform_surface_candidates(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, float]:
     tri = vertices[faces]
     cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     areas = 0.5 * np.linalg.norm(cross, axis=1)
@@ -69,19 +70,81 @@ def sample_query_points(mesh, n: int = 5000, seed: int = 0) -> np.ndarray:
     if not np.isfinite(total) or total <= 0:
         raise ValueError("mesh has zero surface area")
 
-    rng = np.random.default_rng(seed)
-    face_ids = rng.choice(len(faces), size=int(n), p=areas / total)
+    face_ids = rng.choice(len(faces), size=int(count), p=areas / total)
     selected = tri[face_ids]
-    r1 = np.sqrt(rng.random(int(n)))
-    r2 = rng.random(int(n))
+    r1 = np.sqrt(rng.random(int(count)))
+    r2 = rng.random(int(count))
     a = 1.0 - r1
     b = r1 * (1.0 - r2)
     c = r1 * r2
-    return (
+    points = (
         a[:, None] * selected[:, 0]
         + b[:, None] * selected[:, 1]
         + c[:, None] * selected[:, 2]
     )
+    return points, total
+
+
+def _poisson_reject(points: np.ndarray, radius: float, count: int) -> np.ndarray:
+    """Greedily enforce a Euclidean Poisson-disk radius with a 3D hash grid."""
+    if radius <= 0:
+        return np.asarray(points[:count], dtype=np.float64)
+    inv = 1.0 / radius
+    radius_sq = radius * radius
+    offsets = tuple(
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+    )
+    grid: dict[tuple[int, int, int], list[np.ndarray]] = {}
+    accepted: list[np.ndarray] = []
+    for point in points:
+        key_arr = np.floor(point * inv).astype(np.int64)
+        key = (int(key_arr[0]), int(key_arr[1]), int(key_arr[2]))
+        keep = True
+        for dx, dy, dz in offsets:
+            neighbour = (key[0] + dx, key[1] + dy, key[2] + dz)
+            for other in grid.get(neighbour, ()):
+                delta = point - other
+                if float(delta @ delta) < radius_sq:
+                    keep = False
+                    break
+            if not keep:
+                break
+        if keep:
+            accepted.append(point)
+            grid.setdefault(key, []).append(point)
+            if len(accepted) == count:
+                break
+    return np.asarray(accepted, dtype=np.float64)
+
+
+def sample_query_points(mesh, n: int = 5000, seed: int = 0) -> np.ndarray:
+    """Sample exactly ``n`` surface points with Poisson-disk spacing.
+
+    The paper specifies Poisson disk sampling but does not publish its mesh
+    implementation or ``N_Q^raw``. We therefore keep the required property
+    explicit: area-uniform surface candidates followed by deterministic
+    minimum-distance rejection.
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    vertices, faces = _mesh_arrays(mesh)
+    rng = np.random.default_rng(seed)
+    candidates, area = _uniform_surface_candidates(vertices, faces, int(n) * 8, rng)
+
+    radius = math.sqrt(area / (3.0 * int(n)))
+    for _ in range(16):
+        sampled = _poisson_reject(candidates, radius, int(n))
+        if len(sampled) == int(n):
+            return sampled
+        radius *= 0.9
+
+    sampled = _poisson_reject(candidates, 0.0, int(n))
+    if len(sampled) != int(n):
+        raise RuntimeError(f"Could only sample {len(sampled)}/{n} surface points")
+    return sampled
 
 
 def _base_icosahedron() -> tuple[np.ndarray, np.ndarray]:
