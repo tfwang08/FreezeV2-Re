@@ -9,6 +9,14 @@ on:
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/bop-reference.yml"
+      - "freezev2/bop.py"
+      - "run_bop.py"
+      - "pyproject.toml"
+      - "tests/test_bop.py"
   workflow_dispatch:
 
 jobs:
