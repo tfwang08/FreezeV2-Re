@@ -33,3 +33,29 @@ def backproject_depth(depth: np.ndarray, K: np.ndarray, mask: np.ndarray | None 
     pts = np.stack([x, y, z], axis=1)
     uv = np.stack([u, v], axis=1)
     return pts, uv
+
+
+def transform_points(points: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points must be Nx3")
+    if R.shape != (3, 3):
+        raise ValueError("R must be 3x3")
+    return points @ R.T + t
+
+
+def project_points(points: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray):
+    K = np.asarray(K, dtype=np.float64)
+    if K.shape != (3, 3):
+        raise ValueError("K must be 3x3")
+    camera_points = transform_points(points, R, t)
+    z = camera_points[:, 2]
+    uv = np.full((len(camera_points), 2), np.nan, dtype=np.float64)
+    valid = z > 0
+    if np.any(valid):
+        p = camera_points[valid]
+        uv[valid, 0] = K[0, 0] * p[:, 0] / p[:, 2] + K[0, 2]
+        uv[valid, 1] = K[1, 1] * p[:, 1] / p[:, 2] + K[1, 2]
+    return uv, z
