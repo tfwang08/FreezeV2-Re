@@ -6,24 +6,28 @@ The codebase is intentionally small. There is no pose-specific training or fine-
 
 ## Current baseline
 
-The `main` branch currently contains the geometry/matching core needed after feature extraction:
+The `main` branch currently contains:
 
+- BOP reference/evaluation harness
+- deterministic CAD surface sampling
+- CNOS 162-view CAD onboarding cameras
+- 480x480 RGB/depth template rendering with explicit 50% frame fill
+- query-point visibility mapping and compressed onboarding cache
 - RGB-D backprojection
 - 16x16 sparse target sampling
 - top-k cosine descriptor matching
 - Kabsch rigid alignment
 - feature-aware 3D-3D RANSAC
 - BOP CSV submission writer
-- end-to-end synthetic pose recovery tests
-
-Stage 1 adds a reproducible BOP reference harness before any DINOv2/GeDi implementation. It downloads only the official BOP19 challenge test subset, downloads the authors' untouched FreeZeV2.1 submission, and delegates all VSD/MSSD/MSPD scoring to the official BOP Toolkit.
 
 ## Install / test
 
 ```bash
-pip install -e '.[data,test]'
+pip install -e '.[data,onboard,test]'
 pytest -q
 ```
+
+The project explicitly restricts setuptools discovery to `freezev2*`, so an `external/` directory such as `external/bop_toolkit` does not become an accidental Python package.
 
 ## Stage 1: prepare BOP data and reproduce the public score
 
@@ -71,7 +75,7 @@ python run_bop.py evaluate-reference \
   --eval-root outputs/bop_eval
 ```
 
-`run_bop.py` calls `scripts/eval_bop19_pose.py` from the pinned BOP Toolkit. It does not reimplement BOP metrics.
+`run_bop.py` calls `scripts/eval_bop19_pose.py` from the pinned BOP Toolkit. It does not reimplement VSD/MSSD/MSPD.
 
 ### LM-O reference target
 
@@ -85,7 +89,56 @@ The untouched FreeZeV2.1 public submission should reproduce:
 | AR_MSPD | 0.861 |
 | Time / image | 29.805 s |
 
-This exact offline reproduction is the stop gate for Stage 1. We do not move on to DINOv2/GeDi until the evaluator agrees with the public leaderboard.
+## Stage 2: CAD onboarding
+
+FreeZeV2 renders 162 templates per object using the viewpoints proposed by CNOS. The implementation reproduces the CNOS 162-view icosphere geometry in NumPy and keeps the paper's render normalization explicit: square 480x480 renders with the projected model spanning approximately 50% of the frame.
+
+The 5k query cloud is sampled uniformly over triangle surface area. The camera-distance normalization is an explicit reproduction choice because the paper specifies the final image occupancy but does not publish a unique focal-length/camera-distance pair.
+
+For a first real stop-gate check on LM-O object 1:
+
+```bash
+mkdir -p outputs/onboard/lmo_obj_000001/rgb
+
+python - <<'PY'
+from pathlib import Path
+from PIL import Image
+from freezev2.onboard import (
+    load_mesh,
+    make_template_cameras,
+    render_templates,
+    sample_query_points,
+    save_onboarding_cache,
+)
+
+mesh = load_mesh("data/bop/lmo/models/obj_000001.ply")
+query_points = sample_query_points(mesh, n=5000, seed=0)
+cameras = make_template_cameras(n=162, size=480)
+templates = render_templates(mesh, cameras, size=480, target_fill=0.5)
+
+out = Path("outputs/onboard/lmo_obj_000001")
+for i, template in enumerate(templates):
+    Image.fromarray(template.rgb).save(out / "rgb" / f"{i:03d}.png")
+
+save_onboarding_cache(
+    out / "onboarding.npz",
+    query_points,
+    [template.camera for template in templates],
+)
+print("query_points:", query_points.shape)
+print("templates:", len(templates))
+print("cache:", out / "onboarding.npz")
+PY
+```
+
+Expected structural output:
+
+```text
+query_points: (5000, 3)
+templates: 162
+```
+
+Before adding DINOv2, inspect the 162 RGB renders and verify the object is centered, fully visible, and approximately half-frame across viewpoints.
 
 ## Seven BOP Classic-Core reference targets
 
