@@ -250,6 +250,62 @@ def _view_weight_matrix(view_weights, num_views: int, num_points: int) -> np.nda
     return weights
 
 
+def _accumulate_view(
+    query_points: np.ndarray,
+    template: Template,
+    feature_map,
+    image_hw: tuple[int, int],
+    depth_tolerance: float,
+    point_weights: np.ndarray,
+    sums: np.ndarray,
+    weight_sums: np.ndarray,
+    counts: np.ndarray,
+) -> None:
+    ids, pixels = map_visible_pixels_to_query_points(
+        query_points,
+        template.depth,
+        template.camera,
+        depth_tolerance=depth_tolerance,
+    )
+    if len(ids) == 0:
+        return
+
+    image_h, image_w = map(int, image_hw)
+    inside = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < image_w)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < image_h)
+    )
+    ids = ids[inside]
+    pixels = pixels[inside]
+    if len(ids) == 0:
+        return
+
+    sampled = sample_feature_map(feature_map, pixels, image_hw=(image_h, image_w))
+    sampled_np = sampled.detach().to("cpu").numpy().astype(np.float64, copy=False)
+    weights = point_weights[ids]
+    sums[ids] += sampled_np * weights[:, None]
+    weight_sums[ids] += weights
+    counts[ids] += 1
+
+
+def _finish_query_aggregation(
+    query_points: np.ndarray,
+    sums: np.ndarray,
+    weight_sums: np.ndarray,
+    counts: np.ndarray,
+    min_views: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    keep = (counts >= int(min_views)) & (weight_sums > 0)
+    descriptors = sums[keep] / weight_sums[keep, None]
+    return (
+        query_points[keep].copy(),
+        descriptors.astype(np.float32),
+        counts[keep].copy(),
+    )
+
+
 def aggregate_query_visual_features(
     query_points: np.ndarray,
     templates: Sequence[Template],
@@ -259,7 +315,7 @@ def aggregate_query_visual_features(
     view_weights=None,
     feature_image_hws: Sequence[tuple[int, int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Aggregate rendered DINO observations onto query surface points.
+    """Aggregate already-extracted DINO observations onto query surface points.
 
     FreeZeV2 keeps points visible in at least 18 views and describes the visual
     descriptor as a weighted average of per-view DINO features. The paper does
@@ -304,47 +360,90 @@ def aggregate_query_visual_features(
     counts = np.zeros(len(query_points), dtype=np.int32)
 
     for view_id, (template, feature_map) in enumerate(zip(templates, feature_maps)):
-        ids, pixels = map_visible_pixels_to_query_points(
-            query_points,
-            template.depth,
-            template.camera,
-            depth_tolerance=depth_tolerance,
-        )
-        if len(ids) == 0:
-            continue
-
         image_hw = (
             tuple(map(int, template.depth.shape[:2]))
             if feature_image_hws is None
             else tuple(map(int, feature_image_hws[view_id]))
         )
-        image_h, image_w = image_hw
-        inside = (
-            (pixels[:, 0] >= 0)
-            & (pixels[:, 0] < image_w)
-            & (pixels[:, 1] >= 0)
-            & (pixels[:, 1] < image_h)
-        )
-        ids = ids[inside]
-        pixels = pixels[inside]
-        if len(ids) == 0:
-            continue
-
-        sampled = sample_feature_map(
+        _accumulate_view(
+            query_points,
+            template,
             feature_map,
-            pixels,
-            image_hw=image_hw,
+            image_hw,
+            depth_tolerance,
+            weights[view_id],
+            sums,
+            weight_sums,
+            counts,
         )
-        sampled_np = sampled.detach().to("cpu").numpy().astype(np.float64, copy=False)
-        point_weights = weights[view_id, ids]
-        sums[ids] += sampled_np * point_weights[:, None]
-        weight_sums[ids] += point_weights
-        counts[ids] += 1
 
-    keep = (counts >= int(min_views)) & (weight_sums > 0)
-    descriptors = sums[keep] / weight_sums[keep, None]
-    return (
-        query_points[keep].copy(),
-        descriptors.astype(np.float32),
-        counts[keep].copy(),
+    return _finish_query_aggregation(
+        query_points, sums, weight_sums, counts, min_views
+    )
+
+
+def aggregate_query_visual_features_streaming(
+    query_points: np.ndarray,
+    templates: Sequence[Template],
+    extractor: DinoExtractor,
+    depth_tolerance: float,
+    min_views: int = 18,
+    view_weights=None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Encode and aggregate one rendered view at a time.
+
+    This is the preferred 162-view onboarding path: a ViT-g feature map is used
+    immediately and then released instead of caching ~1.1 GB of float32 maps.
+    The actual cropped DINO input size (476x476 for a 480x480 ViT-g/14 render)
+    is taken from ``extractor.last_image_hw`` for every view.
+    """
+    query_points = np.asarray(query_points, dtype=np.float64)
+    if query_points.ndim != 2 or query_points.shape[1] != 3:
+        raise ValueError("query_points must have shape Nx3")
+    if min_views <= 0:
+        raise ValueError("min_views must be positive")
+    if depth_tolerance < 0:
+        raise ValueError("depth_tolerance must be non-negative")
+    if len(templates) == 0:
+        return (
+            query_points[:0],
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    weights = _view_weight_matrix(view_weights, len(templates), len(query_points))
+    sums = None
+    weight_sums = np.zeros(len(query_points), dtype=np.float64)
+    counts = np.zeros(len(query_points), dtype=np.int32)
+
+    for view_id, template in enumerate(templates):
+        feature_map = extractor.encode(template.rgb)
+        if getattr(feature_map, "ndim", None) != 3:
+            raise ValueError("DINO extractor must return a CxHxW feature map")
+        if sums is None:
+            sums = np.zeros(
+                (len(query_points), int(feature_map.shape[0])), dtype=np.float64
+            )
+        elif int(feature_map.shape[0]) != sums.shape[1]:
+            raise ValueError("all DINO views must have the same channel count")
+        image_hw = getattr(extractor, "last_image_hw", None)
+        if image_hw is None:
+            image_hw = tuple(map(int, template.depth.shape[:2]))
+
+        _accumulate_view(
+            query_points,
+            template,
+            feature_map,
+            tuple(map(int, image_hw)),
+            depth_tolerance,
+            weights[view_id],
+            sums,
+            weight_sums,
+            counts,
+        )
+        del feature_map
+
+    assert sums is not None
+    return _finish_query_aggregation(
+        query_points, sums, weight_sums, counts, min_views
     )
