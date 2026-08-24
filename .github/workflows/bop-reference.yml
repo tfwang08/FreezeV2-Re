@@ -1,0 +1,87 @@
+name: BOP reference check
+
+on:
+  push:
+    branches: [reproduce-bop]
+    paths:
+      - ".github/workflows/bop-reference.yml"
+      - "freezev2/bop.py"
+      - "run_bop.py"
+      - "pyproject.toml"
+      - "tests/test_bop.py"
+  workflow_dispatch:
+
+jobs:
+  lmo-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install EGL runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1-mesa-dev libgl1-mesa-dri libglx-mesa0 mesa-utils
+
+      - name: Install FreezeV2-Re and tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[data,test]'
+          pytest -q
+
+      - name: Install pinned BOP Toolkit
+        run: |
+          git clone https://github.com/thodan/bop_toolkit.git external/bop_toolkit
+          git -C external/bop_toolkit checkout cea62d651c7e395b2e1962b9749e4e89693c6ac4
+          pip install ./external/bop_toolkit
+
+      - name: Prepare LM-O BOP19 evaluation data
+        run: python run_bop.py prepare-data --dataset lmo --bop-root data/bop
+
+      - name: Download FreeZeV2.1 LM-O reference submission
+        run: python run_bop.py download-reference --dataset lmo --output-dir data/reference
+
+      - name: Run official BOP19 evaluator
+        env:
+          PYOPENGL_PLATFORM: egl
+        run: |
+          python run_bop.py evaluate-reference \
+            --dataset lmo \
+            --bop-root data/bop \
+            --bop-toolkit external/bop_toolkit \
+            --eval-root outputs/bop_eval \
+            --num-workers 2 | tee reference-eval.json
+
+      - name: Assert official LM-O reference score
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          scores = json.loads(Path('outputs/bop_eval/freezev21_lmo-test/scores_bop19.json').read_text())
+          expected = {
+              'bop19_average_recall': 0.771,
+              'bop19_average_recall_vsd': 0.623,
+              'bop19_average_recall_mssd': 0.829,
+              'bop19_average_recall_mspd': 0.861,
+          }
+          for key, target in expected.items():
+              actual = float(scores[key])
+              print(f'{key}: actual={actual:.6f}, public={target:.6f}')
+              if abs(actual - target) > 5e-4:
+                  raise SystemExit(f'{key} differs from public score by more than 5e-4')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lmo-reference-eval
+          path: |
+            reference-eval.json
+            outputs/bop_eval/freezev21_lmo-test/scores_bop19.json
+          if-no-files-found: ignore
