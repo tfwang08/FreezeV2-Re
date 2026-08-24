@@ -69,6 +69,9 @@ def test_build_eval_command_delegates_to_official_bop_toolkit(tmp_path):
     assert f"--eval_path={eval_root}" in cmd
     assert "--targets_filename=test_targets_bop19.json" in cmd
     assert env["BOP_PATH"] == str(tmp_path / "bop")
+    assert env["PYOPENGL_PLATFORM"] == "egl"
+    assert env["EGL_PLATFORM"] == "surfaceless"
+    assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
 
 
 def test_bop_dataset_patterns_use_only_eval_assets():
