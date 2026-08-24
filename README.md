@@ -97,12 +97,11 @@ Surface points are sampled with deterministic Poisson-disk spacing, matching the
 
 The camera-distance normalization is also an explicit reproduction choice because the paper specifies the final image occupancy but does not publish a unique focal-length/camera-distance pair.
 
-`pyrender` needs its OpenGL backend selected before it is imported. On a headless EGL machine, set `PYOPENGL_PLATFORM=egl` in the shell before running onboarding. Mesa/GLVND library paths remain machine-specific and are intentionally not hard-coded by this repository. This differs from the pinned BOP VisPy renderer, which sets `PYOPENGL_PLATFORM=egl` internally.
+Template rendering uses the pinned BOP Toolkit's `vispy` renderer rather than `pyrender`. This deliberately reuses the same headless EGL path already validated by the Stage-1 evaluator and avoids `pyrender`'s EGL-device enumeration, which can fail under software Mesa/llvmpipe with `Invalid device ID (0)`. Mesa/GLVND library paths remain machine-specific and are intentionally not hard-coded by this repository.
 
 For a first real stop-gate check on LM-O object 1:
 
 ```bash
-export PYOPENGL_PLATFORM=egl
 mkdir -p outputs/onboard/lmo_obj_000001/rgb
 
 python - <<'PY'
@@ -116,10 +115,11 @@ from freezev2.onboard import (
     save_onboarding_cache,
 )
 
-mesh = load_mesh("data/bop/lmo/models/obj_000001.ply")
+mesh_path = "data/bop/lmo/models/obj_000001.ply"
+mesh = load_mesh(mesh_path)
 query_points = sample_query_points(mesh, n=5000, seed=0)
 cameras = make_template_cameras(n=162, size=480)
-templates = render_templates(mesh, cameras, size=480, target_fill=0.5)
+templates = render_templates(mesh_path, cameras, size=480, target_fill=0.5)
 
 out = Path("outputs/onboard/lmo_obj_000001")
 for i, template in enumerate(templates):
