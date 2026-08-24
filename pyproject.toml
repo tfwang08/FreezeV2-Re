@@ -11,7 +11,12 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 data = ["huggingface_hub>=0.26"]
+onboard = ["trimesh>=4.4", "pyrender>=0.1.45", "Pillow>=10"]
 test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["freezev2*"]
+exclude = ["external*", "tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
