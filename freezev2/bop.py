@@ -208,9 +208,6 @@ def build_eval_command(
     ]
     env = os.environ.copy()
     env["BOP_PATH"] = str(Path(bop_root))
-    env.setdefault("PYOPENGL_PLATFORM", "egl")
-    env.setdefault("EGL_PLATFORM", "surfaceless")
-    env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
     return cmd, env
 
 
