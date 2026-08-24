@@ -51,7 +51,10 @@ def test_validate_bop_result_rows_rejects_bad_translation():
         validate_bop_result_rows(rows)
 
 
-def test_build_eval_command_delegates_to_official_bop_toolkit(tmp_path):
+def test_build_eval_command_delegates_to_official_bop_toolkit(tmp_path, monkeypatch):
+    for name in ("PYOPENGL_PLATFORM", "EGL_PLATFORM", "LIBGL_ALWAYS_SOFTWARE"):
+        monkeypatch.delenv(name, raising=False)
+
     toolkit = tmp_path / "bop_toolkit"
     result = tmp_path / "results" / "freezev21_lmo-test.csv"
     eval_root = tmp_path / "eval"
@@ -69,9 +72,9 @@ def test_build_eval_command_delegates_to_official_bop_toolkit(tmp_path):
     assert f"--eval_path={eval_root}" in cmd
     assert "--targets_filename=test_targets_bop19.json" in cmd
     assert env["BOP_PATH"] == str(tmp_path / "bop")
-    assert env["PYOPENGL_PLATFORM"] == "egl"
-    assert env["EGL_PLATFORM"] == "surfaceless"
-    assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
+    assert "PYOPENGL_PLATFORM" not in env
+    assert "EGL_PLATFORM" not in env
+    assert "LIBGL_ALWAYS_SOFTWARE" not in env
 
 
 def test_bop_dataset_patterns_use_only_eval_assets():
