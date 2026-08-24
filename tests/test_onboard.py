@@ -1,3 +1,6 @@
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -106,11 +109,88 @@ def test_onboarding_cache_round_trip(tmp_path):
     assert float(data["diameter"]) == 3.0
 
 
-def test_rendered_cube_depth_maps_back_to_visible_surface():
-    pytest.importorskip("pyrender")
-    mesh = cube_mesh()
+def test_render_templates_uses_bop_vispy_backend(tmp_path, monkeypatch):
+    trimesh = pytest.importorskip("trimesh")
+    source = cube_mesh()
+    mesh = trimesh.Trimesh(vertices=source.vertices, faces=source.faces, process=False)
+    mesh_path = tmp_path / "cube.ply"
+    mesh.export(mesh_path)
+
+    calls = {}
+
+    class FakeRenderer:
+        def set_light_cam_pos(self, value):
+            calls["light_pos"] = tuple(value)
+
+        def set_light_ambient_weight(self, value):
+            calls["ambient"] = value
+
+        def add_object(self, obj_id, model_path, **kwargs):
+            calls["obj_id"] = obj_id
+            calls["model_path"] = str(model_path)
+            calls["add_kwargs"] = kwargs
+
+        def render_object(self, obj_id, R, t, fx, fy, cx, cy):
+            calls["render"] = (obj_id, R.copy(), t.copy(), fx, fy, cx, cy)
+            depth = np.zeros((64, 64), dtype=np.float32)
+            depth[16:48, 16:48] = 3.0
+            return {
+                "rgb": np.full((64, 64, 3), 127, dtype=np.uint8),
+                "depth": depth,
+            }
+
+        def remove_object(self, obj_id):
+            calls["removed"] = obj_id
+
+    renderer_module = types.ModuleType("bop_toolkit_lib.rendering.renderer")
+
+    def create_renderer(width, height, **kwargs):
+        calls["create"] = (width, height, kwargs)
+        return FakeRenderer()
+
+    renderer_module.create_renderer = create_renderer
+    rendering_module = types.ModuleType("bop_toolkit_lib.rendering")
+    rendering_module.renderer = renderer_module
+    bop_module = types.ModuleType("bop_toolkit_lib")
+    bop_module.rendering = rendering_module
+    monkeypatch.setitem(sys.modules, "bop_toolkit_lib", bop_module)
+    monkeypatch.setitem(sys.modules, "bop_toolkit_lib.rendering", rendering_module)
+    monkeypatch.setitem(sys.modules, "bop_toolkit_lib.rendering.renderer", renderer_module)
+
     template = render_templates(
-        mesh,
+        mesh_path,
+        make_template_cameras(162, size=64)[:1],
+        size=64,
+        target_fill=0.5,
+    )[0]
+
+    assert calls["create"] == (
+        64,
+        64,
+        {
+            "renderer_type": "vispy",
+            "mode": "rgb+depth",
+            "shading": "flat",
+            "bg_color": (0.0, 0.0, 0.0, 0.0),
+        },
+    )
+    assert calls["obj_id"] == 1
+    assert calls["removed"] == 1
+    assert template.rgb.shape == (64, 64, 3)
+    assert template.depth.shape == (64, 64)
+    assert template.mask.any()
+
+
+def test_rendered_cube_depth_maps_back_to_visible_surface(tmp_path):
+    pytest.importorskip("bop_toolkit_lib")
+    trimesh = pytest.importorskip("trimesh")
+    source = cube_mesh()
+    mesh = trimesh.Trimesh(vertices=source.vertices, faces=source.faces, process=False)
+    mesh_path = tmp_path / "cube.ply"
+    mesh.export(mesh_path)
+
+    template = render_templates(
+        mesh_path,
         make_template_cameras(162, size=64)[:1],
         size=64,
         target_fill=0.5,
