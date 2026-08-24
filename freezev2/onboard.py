@@ -428,3 +428,81 @@ def save_onboarding_cache(
     payload.update(extra_arrays)
     np.savez_compressed(path, **payload)
     return path
+
+
+def load_onboarding_templates(
+    cache_path: str | Path,
+    rgb_dir: str | Path,
+) -> list[Template]:
+    """Reload RGB/depth/camera templates without requiring a renderer.
+
+    Stage 2 stores rendered RGB images as PNGs and the corresponding depth stack
+    in ``onboarding.npz`` under ``template_depth``. This lets the CUDA feature
+    environment perform DINO aggregation without importing BOP/VisPy/Mesa.
+    """
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Install onboarding dependencies with: pip install -e '.[onboard]'") from exc
+
+    cache_path = Path(cache_path)
+    rgb_dir = Path(rgb_dir)
+    rgb_paths = sorted(rgb_dir.glob("*.png"))
+
+    with np.load(cache_path) as data:
+        required = (
+            "camera_R",
+            "camera_t",
+            "camera_K",
+            "camera_direction",
+            "camera_size",
+            "template_depth",
+        )
+        missing = [name for name in required if name not in data]
+        if missing:
+            raise ValueError(
+                "onboarding cache is missing: " + ", ".join(missing)
+            )
+
+        depths = np.asarray(data["template_depth"], dtype=np.float32)
+        camera_R = np.asarray(data["camera_R"], dtype=np.float64)
+        camera_t = np.asarray(data["camera_t"], dtype=np.float64)
+        camera_K = np.asarray(data["camera_K"], dtype=np.float64)
+        camera_direction = np.asarray(data["camera_direction"], dtype=np.float64)
+        camera_size = np.asarray(data["camera_size"], dtype=np.int32)
+
+    count = len(camera_R)
+    if not (
+        len(camera_t)
+        == len(camera_K)
+        == len(camera_direction)
+        == len(camera_size)
+        == len(depths)
+        == count
+    ):
+        raise ValueError("onboarding cache template arrays have inconsistent lengths")
+    if len(rgb_paths) != count:
+        raise ValueError(
+            f"expected {count} RGB templates in {rgb_dir}, found {len(rgb_paths)}"
+        )
+
+    templates: list[Template] = []
+    for idx, rgb_path in enumerate(rgb_paths):
+        rgb = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8).copy()
+        depth = np.asarray(depths[idx], dtype=np.float32).copy()
+        if rgb.shape[:2] != depth.shape[:2]:
+            raise ValueError(
+                f"RGB/depth shape mismatch for template {idx}: "
+                f"{rgb.shape[:2]} vs {depth.shape[:2]}"
+            )
+        camera = CameraPose(
+            R=camera_R[idx].copy(),
+            t=camera_t[idx].copy(),
+            K=camera_K[idx].copy(),
+            size=int(camera_size[idx]),
+            direction=camera_direction[idx].copy(),
+        )
+        templates.append(
+            Template(rgb=rgb, depth=depth, mask=depth > 0, camera=camera)
+        )
+    return templates
