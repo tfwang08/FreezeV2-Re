@@ -58,3 +58,41 @@ def test_visibility_counts_accumulate_across_views():
     )
 
     assert counts.tolist() == [2]
+
+
+def test_bilinear_visibility_recovers_subpixel_planar_depth():
+    camera = CameraPose(
+        R=np.eye(3),
+        t=np.zeros(3),
+        K=np.eye(3),
+        size=4,
+        direction=np.array([0.0, 0.0, 1.0]),
+    )
+    y, x = np.mgrid[:4, :4]
+    depth = (1.0 + 0.1 * x + 0.2 * y).astype(np.float32)
+    template = Template(
+        rgb=np.zeros((4, 4, 3), dtype=np.uint8),
+        depth=depth,
+        mask=depth > 0,
+        camera=camera,
+    )
+
+    u, v = 1.25, 1.5
+    z = 1.0 + 0.1 * u + 0.2 * v
+    query_points = np.array([[u * z, v * z, z]])
+
+    nearest = query_visibility_counts(
+        query_points,
+        [template],
+        depth_tolerance=0.01,
+        sampling="nearest",
+    )
+    bilinear = query_visibility_counts(
+        query_points,
+        [template],
+        depth_tolerance=1e-5,
+        sampling="bilinear",
+    )
+
+    assert nearest.tolist() == [0]
+    assert bilinear.tolist() == [1]
