@@ -13,6 +13,9 @@ GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
 OPEN3D_ROOT="${FREEZEV2_OPEN3D_ROOT:-external/open3d}"
 OPEN3D_BUILD="${FREEZEV2_OPEN3D_BUILD:-$OPEN3D_ROOT/build-freeze}"
 BUILD_JOBS="${FREEZEV2_BUILD_JOBS:-8}"
+PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
+PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
+PIP_ARGS=(-i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST")
 
 _load_conda() {
     if declare -F conda >/dev/null 2>&1; then
@@ -130,7 +133,7 @@ PY
 # Build Open3D's official PyTorch ops against the PyTorch already installed in
 # freeze. Do not install a released Open3D wheel because its torch build version
 # is unrelated to this environment.
-python -m pip install "cmake>=3.24" ninja wheel setuptools
+python -m pip install "${PIP_ARGS[@]}" "cmake>=3.24" ninja wheel setuptools
 
 if [[ ! -d "$OPEN3D_ROOT/.git" ]]; then
     git clone https://github.com/isl-org/Open3D.git "$OPEN3D_ROOT"
@@ -171,7 +174,7 @@ fi
 
 # --no-deps is intentional: this build must not replace torch or other freeze
 # packages. The wheel contains the Open3D core and official torch ops.
-python -m pip install --force-reinstall --no-deps "$OPEN3D_WHEEL"
+python -m pip install "${PIP_ARGS[@]}" --force-reinstall --no-deps "$OPEN3D_WHEEL"
 
 python - <<'PY'
 import open3d
@@ -195,7 +198,7 @@ fi
 git -C "$GEDI_ROOT" fetch --all --tags
 git -C "$GEDI_ROOT" checkout "$GEDI_COMMIT"
 
-python -m pip install torchgeometry==0.1.2 gdown
+python -m pip install "${PIP_ARGS[@]}" torchgeometry==0.1.2 gdown
 
 # GeDi vendors the official PointNet2 extension. Its 2022 setup.py hard-codes
 # CUDA architectures 3.7..7.5, which CUDA 13 can no longer compile. This patch
@@ -216,7 +219,7 @@ elif new not in text:
 PY
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
-python -m pip install --no-build-isolation "$GEDI_ROOT/backbones/pointnet2_ops_lib/"
+python -m pip install "${PIP_ARGS[@]}" --no-build-isolation "$GEDI_ROOT/backbones/pointnet2_ops_lib/"
 python "$GEDI_ROOT/download_data.py"
 
 python - <<'PY'
