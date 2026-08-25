@@ -4,30 +4,23 @@ set -eo pipefail
 # Prebuilt-only GeDi environment setup.
 #
 # Do not compile Open3D or PointNet2 in this script. Open3D 0.19.0's released
-# wheel was built for PyTorch 2.2.*, so the existing freeze environment is
-# intentionally pinned to that compatible binary stack.
+# wheel was built for PyTorch 2.2.*, so freeze is pinned to that binary stack.
+# The official GeDi checkpoint is also treated as an explicit local input:
+# cluster nodes may not have network access to Google Drive.
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
 
-# Request the public PyTorch release versions here. The CUDA local-version
-# suffix (+cu121) is supplied by the wheel selected from the cu121 index and is
-# verified after installation.
 TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-2.2.2}"
 TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-0.17.2}"
 TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-2.2.2}"
 NUMPY_VERSION="${FREEZEV2_NUMPY_VERSION:-1.26.4}"
 OPEN3D_VERSION="${FREEZEV2_OPEN3D_VERSION:-0.19.0}"
-GDOWN_VERSION="${FREEZEV2_GDOWN_VERSION:-5.2.2}"
 
 PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
 PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
 PYTORCH_INDEX_URL="${FREEZEV2_PYTORCH_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pytorch-wheels/cu121}"
 
-# The cluster image may inject extra pip indexes (for example NVIDIA NGC) via
-# environment variables or pip config. Keep this setup deterministic and avoid
-# DNS retries to unrelated indexes: every pip invocation below starts from a
-# clean pip configuration and uses only indexes explicitly supplied here.
 _pip_clean() {
     env \
         -u PIP_INDEX_URL \
@@ -83,8 +76,7 @@ echo "[FreezeV2-Re] switching freeze to the released Open3D-compatible binary st
 echo "[FreezeV2-Re] PyTorch index: $PYTORCH_INDEX_URL"
 echo "[FreezeV2-Re] PyPI index: $PIP_INDEX_URL"
 
-# PyTorch's official CUDA 12.1 install command requests 2.2.2 / 0.17.2 /
-# 2.2.2 from the cu121 index. The installed wheel reports 2.2.2+cu121.
+# PyTorch's CUDA 12.1 wheel reports 2.2.2+cu121 after installation.
 _pip_clean install \
     --force-reinstall \
     --no-cache-dir \
@@ -95,29 +87,19 @@ _pip_clean install \
     "torchvision==$TORCHVISION_VERSION" \
     "torchaudio==$TORCHAUDIO_VERSION"
 
-# Open3D 0.19.0 was built against NumPy 1.x. Pin NumPy before installing the
-# released wheel so pip does not leave a NumPy 2.x runtime in the environment.
-# GeDi's pinned download_data.py calls gdown.download(..., fuzzy=True). gdown
-# 6.x removed that argument, while gdown 5.2.2 still provides it, so keep the
-# dependency at the last compatible 5.x release instead of modifying GeDi.
 _pip_clean install \
     --index-url "$PIP_INDEX_URL" \
     --trusted-host "$PIP_TRUSTED_HOST" \
     --upgrade \
     "numpy==$NUMPY_VERSION" \
     "open3d==$OPEN3D_VERSION" \
-    "torchgeometry==0.1.2" \
-    "gdown==$GDOWN_VERSION"
+    "torchgeometry==0.1.2"
 
 python - <<'PY'
 import numpy as np
 import open3d
 import open3d.ml.torch as ml3d
 import torch
-
-expected_torch = "2.2.2+cu121"
-expected_numpy = "1.26.4"
-expected_open3d = "0.19.0"
 
 print("[FreezeV2-Re] torch:", torch.__version__)
 print("[FreezeV2-Re] torch CUDA:", torch.version.cuda)
@@ -126,53 +108,77 @@ if torch.cuda.is_available():
     print("[FreezeV2-Re] GPU:", torch.cuda.get_device_name(0))
 print("[FreezeV2-Re] NumPy:", np.__version__)
 print("[FreezeV2-Re] Open3D:", open3d.__version__)
-print("[FreezeV2-Re] Open3D build config:", open3d._build_config)
 print("[FreezeV2-Re] Open3D CUDA available:", open3d.core.cuda.is_available())
 print("[FreezeV2-Re] Open3D ML loaded:", ml3d._loaded)
 print("[FreezeV2-Re] radius_search:", ml3d.ops.radius_search)
 
-if torch.__version__ != expected_torch:
+if torch.__version__ != "2.2.2+cu121":
     raise SystemExit(f"unexpected torch version: {torch.__version__}")
-if torch.version.cuda != "12.1":
-    raise SystemExit(f"unexpected torch CUDA version: {torch.version.cuda}")
-if not torch.cuda.is_available():
-    raise SystemExit("PyTorch CUDA is unavailable")
-if np.__version__ != expected_numpy:
+if torch.version.cuda != "12.1" or not torch.cuda.is_available():
+    raise SystemExit("PyTorch CUDA 12.1 is unavailable")
+if np.__version__ != "1.26.4":
     raise SystemExit(f"unexpected NumPy version: {np.__version__}")
-if open3d.__version__ != expected_open3d:
+if open3d.__version__ != "0.19.0":
     raise SystemExit(f"unexpected Open3D version: {open3d.__version__}")
-if not ml3d._loaded:
-    raise SystemExit("Open3D PyTorch ops failed to load")
-if not open3d.core.cuda.is_available():
-    raise SystemExit("released Open3D wheel has no usable CUDA backend")
+if not ml3d._loaded or not open3d.core.cuda.is_available():
+    raise SystemExit("released Open3D CUDA/PyTorch ops are unavailable")
 PY
 
-# Keep using the official GeDi source/checkpoint, but do not build its vendored
-# PointNet2 extension. A prebuilt PointNet2 wheel must be supplied explicitly.
 if [[ ! -d "$GEDI_ROOT/.git" ]]; then
     git clone https://github.com/fabiopoiesi/gedi.git "$GEDI_ROOT"
 fi
 git -C "$GEDI_ROOT" fetch --all --tags
 git -C "$GEDI_ROOT" checkout "$GEDI_COMMIT"
-python "$GEDI_ROOT/download_data.py"
+
+# FreeZeV2 only needs the GeDi 3DMatch checkpoint. The assets downloaded by
+# GeDi's demo script are not used by this reproduction.
+GEDI_CHECKPOINT_CANONICAL="$GEDI_ROOT/data/chkpts/3dmatch/chkpt.tar"
+GEDI_CHECKPOINT_INPUT="${FREEZEV2_GEDI_CHECKPOINT:-$GEDI_CHECKPOINT_CANONICAL}"
+
+if [[ "$GEDI_CHECKPOINT_INPUT" != "$GEDI_CHECKPOINT_CANONICAL" ]]; then
+    if [[ ! -s "$GEDI_CHECKPOINT_INPUT" ]]; then
+        echo "[FreezeV2-Re] GeDi checkpoint not found: $GEDI_CHECKPOINT_INPUT" >&2
+        exit 5
+    fi
+    mkdir -p "$(dirname "$GEDI_CHECKPOINT_CANONICAL")"
+    GEDI_CHECKPOINT_ABS="$(python - "$GEDI_CHECKPOINT_INPUT" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).resolve())
+PY
+)"
+    ln -sfn "$GEDI_CHECKPOINT_ABS" "$GEDI_CHECKPOINT_CANONICAL"
+fi
+
+if [[ ! -s "$GEDI_CHECKPOINT_CANONICAL" ]]; then
+    cat >&2 <<EOF
+[FreezeV2-Re] STOP: the official GeDi 3DMatch checkpoint is not present.
+[FreezeV2-Re] Required file: $GEDI_CHECKPOINT_CANONICAL
+[FreezeV2-Re] The cluster cannot reach drive.google.com, so automatic gdown
+[FreezeV2-Re] download is intentionally disabled. Download the official GeDi
+[FreezeV2-Re] checkpoint bundle on a machine with Google Drive access, extract
+[FreezeV2-Re] chkpts/3dmatch/chkpt.tar, then either place it at the path above
+[FreezeV2-Re] or set FREEZEV2_GEDI_CHECKPOINT=/path/to/chkpt.tar.
+[FreezeV2-Re] Official Google Drive file id: 1Lpep5QigALjk60h8bNJAUH3DnxtnGcZX
+EOF
+    exit 5
+fi
+
+echo "[FreezeV2-Re] GeDi checkpoint: $GEDI_CHECKPOINT_CANONICAL"
 
 POINTNET2_WHEEL="${FREEZEV2_POINTNET2_WHEEL:-}"
 if [[ -z "$POINTNET2_WHEEL" ]]; then
     cat >&2 <<'EOF'
-[FreezeV2-Re] STOP: Open3D prebuilt wheel stack is ready, but GeDi also needs
-[FreezeV2-Re] the PointNet2 CUDA extension. Official GeDi does not ship a
-[FreezeV2-Re] prebuilt wheel for Python 3.12 / PyTorch 2.2 / CUDA 12.1.
-[FreezeV2-Re] Source/JIT compilation is intentionally disabled.
-[FreezeV2-Re] Set FREEZEV2_POINTNET2_WHEEL only after an exact compatible
-[FreezeV2-Re] prebuilt wheel has been identified.
+[FreezeV2-Re] STOP: Open3D and the GeDi checkpoint are ready, but GeDi also
+[FreezeV2-Re] needs the PointNet2 CUDA extension. Source/JIT compilation is
+[FreezeV2-Re] intentionally disabled. Set FREEZEV2_POINTNET2_WHEEL only after
+[FreezeV2-Re] an exact Python 3.12 / PyTorch 2.2 / CUDA 12.1 wheel is identified.
 EOF
     exit 4
 fi
 
 _pip_clean install --no-deps "$POINTNET2_WHEEL"
 
-# Verify that the supplied binary actually loads against this exact PyTorch/CUDA
-# runtime and can execute one CUDA PointNet2 kernel.
 python - <<'PY'
 import torch
 from pointnet2_ops.pointnet2_modules import PointnetSAModule
