@@ -18,6 +18,7 @@ TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-0.17.2}"
 TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-2.2.2}"
 NUMPY_VERSION="${FREEZEV2_NUMPY_VERSION:-1.26.4}"
 OPEN3D_VERSION="${FREEZEV2_OPEN3D_VERSION:-0.19.0}"
+GDOWN_VERSION="${FREEZEV2_GDOWN_VERSION:-5.2.2}"
 
 PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
 PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
@@ -96,6 +97,9 @@ _pip_clean install \
 
 # Open3D 0.19.0 was built against NumPy 1.x. Pin NumPy before installing the
 # released wheel so pip does not leave a NumPy 2.x runtime in the environment.
+# GeDi's pinned download_data.py calls gdown.download(..., fuzzy=True). gdown
+# 6.x removed that argument, while gdown 5.2.2 still provides it, so keep the
+# dependency at the last compatible 5.x release instead of modifying GeDi.
 _pip_clean install \
     --index-url "$PIP_INDEX_URL" \
     --trusted-host "$PIP_TRUSTED_HOST" \
@@ -103,7 +107,7 @@ _pip_clean install \
     "numpy==$NUMPY_VERSION" \
     "open3d==$OPEN3D_VERSION" \
     "torchgeometry==0.1.2" \
-    gdown
+    "gdown==$GDOWN_VERSION"
 
 python - <<'PY'
 import numpy as np
