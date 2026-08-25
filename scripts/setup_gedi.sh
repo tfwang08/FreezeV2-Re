@@ -97,10 +97,22 @@ fi
 export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
 export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
+CUDA_TARGET_ROOT="${FREEZEV2_CUDA_TARGET_ROOT:-$CONDA_PREFIX/targets/x86_64-linux}"
+CUDA_INCLUDE_DIR="$CUDA_TARGET_ROOT/include"
+CUDA_LIBRARY_DIR="$CUDA_TARGET_ROOT/lib"
 
 if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
     echo "[FreezeV2-Re] nvcc is still unavailable after CUDA-toolkit installation." >&2
     echo "[FreezeV2-Re] expected compiler under: $CONDA_PREFIX/bin" >&2
+    exit 2
+fi
+
+if [[ ! -f "$CUDA_INCLUDE_DIR/cuda_runtime.h" ]]; then
+    echo "[FreezeV2-Re] CUDA headers not found at: $CUDA_INCLUDE_DIR" >&2
+    exit 2
+fi
+if [[ ! -d "$CUDA_LIBRARY_DIR" ]]; then
+    echo "[FreezeV2-Re] CUDA library directory not found at: $CUDA_LIBRARY_DIR" >&2
     exit 2
 fi
 
@@ -119,6 +131,8 @@ export CXX="$HOST_CXX"
 export CUDAHOSTCXX="$HOST_CXX"
 
 echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
+echo "[FreezeV2-Re] CUDA headers: $CUDA_INCLUDE_DIR"
+echo "[FreezeV2-Re] CUDA libraries: $CUDA_LIBRARY_DIR"
 echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
 echo "[FreezeV2-Re] CUDA host compiler: $($HOST_CXX --version | head -n 1)"
 echo "[FreezeV2-Re] CUDA architecture: sm_$CUDA_ARCH"
@@ -172,8 +186,7 @@ fi
 git -C "$OPEN3D_ROOT" fetch --all --tags
 git -C "$OPEN3D_ROOT" checkout "$OPEN3D_COMMIT"
 
-# A previous failed CMake configure caches its compiler selection. Recreate this
-# dedicated build directory so the explicit system host compiler takes effect.
+# A previous failed CMake configure caches its compiler/toolkit selection.
 rm -rf "$OPEN3D_BUILD"
 
 cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
@@ -184,6 +197,12 @@ cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
     -DCMAKE_CUDA_HOST_COMPILER="$HOST_CXX" \
     -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
     -DCUDAToolkit_ROOT="$CUDA_HOME" \
+    -DCUDA_TOOLKIT_ROOT_DIR="$CUDA_HOME" \
+    -DCUDA_NVCC_EXECUTABLE="$NVCC_PATH" \
+    -DCUDA_TOOLKIT_INCLUDE="$CUDA_INCLUDE_DIR" \
+    -DCUDA_INCLUDE_DIRS="$CUDA_INCLUDE_DIR" \
+    -DCMAKE_INCLUDE_PATH="$CUDA_INCLUDE_DIR" \
+    -DCMAKE_LIBRARY_PATH="$CUDA_LIBRARY_DIR" \
     -DBUILD_SHARED_LIBS=ON \
     -DBUILD_PYTHON_MODULE=ON \
     -DBUILD_CUDA_MODULE=ON \
