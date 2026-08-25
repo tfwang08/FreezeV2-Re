@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
+
+# Do not enable `set -u` here. NVIDIA/conda compiler activation and
+# deactivation hooks legitimately probe optional shell variables and are not
+# nounset-safe. Treating those probes as fatal aborts an otherwise successful
+# CUDA-toolkit transaction.
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 OPEN3D_COMMIT="22a6a307b9b7d88604895f79c0ceeecef2fc6538"
@@ -67,24 +72,34 @@ PY
 # The PyTorch wheel contains the CUDA runtime, not nvcc. Keep the existing
 # PyTorch untouched and add the matching CUDA 13.0 developer toolkit to the
 # same freeze conda environment only when the compiler is missing.
-if ! command -v nvcc >/dev/null 2>&1; then
+NVCC_PATH="$(command -v nvcc 2>/dev/null || true)"
+if [[ -z "$NVCC_PATH" && -x "$CONDA_PREFIX/bin/nvcc" ]]; then
+    NVCC_PATH="$CONDA_PREFIX/bin/nvcc"
+fi
+
+if [[ -z "$NVCC_PATH" ]]; then
     echo "[FreezeV2-Re] nvcc not found; installing NVIDIA CUDA toolkit $CUDA_TOOLKIT_VERSION into freeze."
     conda install -y -n freeze -c nvidia --freeze-installed \
         "cuda-toolkit=$CUDA_TOOLKIT_VERSION"
     hash -r
+    NVCC_PATH="$(command -v nvcc 2>/dev/null || true)"
+    if [[ -z "$NVCC_PATH" && -x "$CONDA_PREFIX/bin/nvcc" ]]; then
+        NVCC_PATH="$CONDA_PREFIX/bin/nvcc"
+    fi
 fi
 
 export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
 export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
 
-if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
-    echo "[FreezeV2-Re] nvcc was not found at $CUDA_HOME/bin/nvcc after toolkit installation." >&2
+if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
+    echo "[FreezeV2-Re] nvcc is still unavailable after CUDA-toolkit installation." >&2
+    echo "[FreezeV2-Re] expected compiler under: $CONDA_PREFIX/bin" >&2
     exit 2
 fi
 
 echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
-echo "[FreezeV2-Re] nvcc: $("$CUDA_HOME/bin/nvcc" --version | tail -n 1)"
+echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
 
 TORCH_VERSION_AFTER="$(python - <<'PY'
 import torch
@@ -125,7 +140,7 @@ git -C "$OPEN3D_ROOT" checkout "$OPEN3D_COMMIT"
 
 cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+    -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
     -DCUDAToolkit_ROOT="$CUDA_HOME" \
     -DBUILD_SHARED_LIBS=ON \
     -DBUILD_PYTHON_MODULE=ON \
