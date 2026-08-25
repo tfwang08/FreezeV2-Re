@@ -3,6 +3,7 @@ set -euo pipefail
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 OPEN3D_COMMIT="22a6a307b9b7d88604895f79c0ceeecef2fc6538"
+CUDA_TOOLKIT_VERSION="${FREEZEV2_CUDA_TOOLKIT_VERSION:-13.0.2}"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
 OPEN3D_ROOT="${FREEZEV2_OPEN3D_ROOT:-external/open3d}"
 OPEN3D_BUILD="${FREEZEV2_OPEN3D_BUILD:-$OPEN3D_ROOT/build-freeze}"
@@ -37,6 +38,17 @@ _load_conda() {
 _load_conda
 conda activate freeze
 
+TORCH_VERSION_BEFORE="$(python - <<'PY'
+import torch
+print(torch.__version__)
+PY
+)"
+TORCH_CUDA_BEFORE="$(python - <<'PY'
+import torch
+print(torch.version.cuda)
+PY
+)"
+
 python - <<'PY'
 import sys
 import torch
@@ -52,11 +64,47 @@ if not torch.cuda.is_available():
     raise SystemExit("CUDA is required for GeDi")
 PY
 
+# The PyTorch wheel contains the CUDA runtime, not nvcc. Keep the existing
+# PyTorch untouched and add the matching CUDA 13.0 developer toolkit to the
+# same freeze conda environment only when the compiler is missing.
 if ! command -v nvcc >/dev/null 2>&1; then
-    echo "[FreezeV2-Re] nvcc is required to build Open3D and PointNet2 CUDA ops." >&2
+    echo "[FreezeV2-Re] nvcc not found; installing NVIDIA CUDA toolkit $CUDA_TOOLKIT_VERSION into freeze."
+    conda install -y -n freeze -c nvidia --freeze-installed \
+        "cuda-toolkit=$CUDA_TOOLKIT_VERSION"
+    hash -r
+fi
+
+export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
+export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
+export PATH="$CUDA_HOME/bin:$PATH"
+
+if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+    echo "[FreezeV2-Re] nvcc was not found at $CUDA_HOME/bin/nvcc after toolkit installation." >&2
     exit 2
 fi
-echo "[FreezeV2-Re] nvcc: $(nvcc --version | tail -n 1)"
+
+echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
+echo "[FreezeV2-Re] nvcc: $("$CUDA_HOME/bin/nvcc" --version | tail -n 1)"
+
+TORCH_VERSION_AFTER="$(python - <<'PY'
+import torch
+print(torch.__version__)
+PY
+)"
+TORCH_CUDA_AFTER="$(python - <<'PY'
+import torch
+print(torch.version.cuda)
+PY
+)"
+
+if [[ "$TORCH_VERSION_AFTER" != "$TORCH_VERSION_BEFORE" || "$TORCH_CUDA_AFTER" != "$TORCH_CUDA_BEFORE" ]]; then
+    cat >&2 <<EOF
+[FreezeV2-Re] Refusing to continue: installing the CUDA toolkit changed PyTorch.
+before: torch=$TORCH_VERSION_BEFORE CUDA=$TORCH_CUDA_BEFORE
+after:  torch=$TORCH_VERSION_AFTER CUDA=$TORCH_CUDA_AFTER
+EOF
+    exit 2
+fi
 
 TORCH_ABI="$(python - <<'PY'
 import torch
@@ -65,7 +113,7 @@ PY
 )"
 
 # Build Open3D's official PyTorch ops against the PyTorch already installed in
-# freeze. Do not install the released Open3D wheel because its torch ABI/version
+# freeze. Do not install a released Open3D wheel because its torch build version
 # is unrelated to this environment.
 python -m pip install "cmake>=3.24" ninja wheel setuptools
 
@@ -77,6 +125,8 @@ git -C "$OPEN3D_ROOT" checkout "$OPEN3D_COMMIT"
 
 cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+    -DCUDAToolkit_ROOT="$CUDA_HOME" \
     -DBUILD_SHARED_LIBS=ON \
     -DBUILD_PYTHON_MODULE=ON \
     -DBUILD_CUDA_MODULE=ON \
