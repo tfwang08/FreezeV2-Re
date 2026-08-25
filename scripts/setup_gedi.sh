@@ -2,9 +2,7 @@
 set -eo pipefail
 
 # Do not enable `set -u` here. NVIDIA/conda compiler activation and
-# deactivation hooks legitimately probe optional shell variables and are not
-# nounset-safe. Treating those probes as fatal aborts an otherwise successful
-# CUDA-toolkit transaction.
+# deactivation hooks probe optional shell variables and are not nounset-safe.
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 OPEN3D_COMMIT="22a6a307b9b7d88604895f79c0ceeecef2fc6538"
@@ -24,12 +22,10 @@ _load_conda() {
     if declare -F conda >/dev/null 2>&1; then
         return 0
     fi
-
     local conda_sh=""
     if [[ -n "${CONDA_EXE:-}" ]]; then
         conda_sh="$(dirname "$(dirname "$CONDA_EXE")")/etc/profile.d/conda.sh"
     fi
-
     for candidate in \
         "$conda_sh" \
         "$HOME/miniconda3/etc/profile.d/conda.sh" \
@@ -41,7 +37,6 @@ _load_conda() {
             return 0
         fi
     done
-
     echo "Could not find conda.sh. Initialize conda first." >&2
     return 1
 }
@@ -63,7 +58,6 @@ PY
 python - <<'PY'
 import sys
 import torch
-
 print("[FreezeV2-Re] python:", sys.version.split()[0])
 print("[FreezeV2-Re] torch:", torch.__version__)
 print("[FreezeV2-Re] torch CUDA:", torch.version.cuda)
@@ -75,14 +69,10 @@ if not torch.cuda.is_available():
     raise SystemExit("CUDA is required for GeDi")
 PY
 
-# The PyTorch wheel contains the CUDA runtime, not nvcc. Keep the existing
-# PyTorch untouched and add the matching CUDA 13.0 developer toolkit to the
-# same freeze conda environment only when the compiler is missing.
 NVCC_PATH="$(command -v nvcc 2>/dev/null || true)"
 if [[ -z "$NVCC_PATH" && -x "$CONDA_PREFIX/bin/nvcc" ]]; then
     NVCC_PATH="$CONDA_PREFIX/bin/nvcc"
 fi
-
 if [[ -z "$NVCC_PATH" ]]; then
     echo "[FreezeV2-Re] nvcc not found; installing NVIDIA CUDA toolkit $CUDA_TOOLKIT_VERSION into freeze."
     conda install -y -n freeze -c nvidia --freeze-installed \
@@ -94,60 +84,19 @@ if [[ -z "$NVCC_PATH" ]]; then
     fi
 fi
 
-export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
-export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
-export PATH="$CUDA_HOME/bin:$PATH"
-CUDA_TARGET_ROOT="${FREEZEV2_CUDA_TARGET_ROOT:-$CONDA_PREFIX/targets/x86_64-linux}"
-CUDA_INCLUDE_DIR="$CUDA_TARGET_ROOT/include"
-CUDA_LIBRARY_DIR="$CUDA_TARGET_ROOT/lib"
-
-if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
-    echo "[FreezeV2-Re] nvcc is still unavailable after CUDA-toolkit installation." >&2
-    echo "[FreezeV2-Re] expected compiler under: $CONDA_PREFIX/bin" >&2
-    exit 2
+# Open3D's core library always includes legacy visualization on Linux and
+# therefore requires OpenGL/EGL development files even when BUILD_GUI=OFF.
+# Install GLVND (vendor-neutral dispatch) development packages, not Mesa.
+if [[ ! -f "$CONDA_PREFIX/include/EGL/egl.h" || \
+      ! -e "$CONDA_PREFIX/lib/libEGL.so" || \
+      ! -e "$CONDA_PREFIX/lib/libOpenGL.so" ]]; then
+    echo "[FreezeV2-Re] installing GLVND OpenGL/EGL development files into freeze."
+    conda install -y -n freeze -c conda-forge --freeze-installed \
+        "libgl-devel=1.7.0" \
+        "libegl-devel=1.7.0" \
+        "libopengl-devel=1.7.0"
+    hash -r
 fi
-
-if [[ ! -f "$CUDA_INCLUDE_DIR/cuda_runtime.h" ]]; then
-    echo "[FreezeV2-Re] CUDA headers not found at: $CUDA_INCLUDE_DIR" >&2
-    exit 2
-fi
-if [[ ! -d "$CUDA_LIBRARY_DIR" ]]; then
-    echo "[FreezeV2-Re] CUDA library directory not found at: $CUDA_LIBRARY_DIR" >&2
-    exit 2
-fi
-
-if [[ ! -x "$HOST_CC" || ! -x "$HOST_CXX" ]]; then
-    echo "[FreezeV2-Re] system host compiler not found: $HOST_CC / $HOST_CXX" >&2
-    exit 2
-fi
-
-# Conda's compiler activation hook may inject NVCC_PREPEND_FLAGS=-ccbin=<conda
-# compiler>. With CUDA 13 + the conda GCC 14/sysroot pair this produces math.h
-# declaration conflicts before Open3D itself is compiled. Keep the conda Python
-# environment, but use the system compiler as nvcc's host compiler.
-unset NVCC_PREPEND_FLAGS
-export CC="$HOST_CC"
-export CXX="$HOST_CXX"
-export CUDAHOSTCXX="$HOST_CXX"
-
-echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
-echo "[FreezeV2-Re] CUDA headers: $CUDA_INCLUDE_DIR"
-echo "[FreezeV2-Re] CUDA libraries: $CUDA_LIBRARY_DIR"
-echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
-echo "[FreezeV2-Re] CUDA host compiler: $($HOST_CXX --version | head -n 1)"
-echo "[FreezeV2-Re] CUDA architecture: sm_$CUDA_ARCH"
-
-# Fail fast before the much larger Open3D configure/build if nvcc and the
-# selected host compiler cannot compile together.
-CUDA_CHECK_DIR="$(mktemp -d)"
-cat > "$CUDA_CHECK_DIR/check.cu" <<'CU'
-#include <cuda_runtime.h>
-int main() { return 0; }
-CU
-"$NVCC_PATH" -ccbin "$HOST_CXX" -std=c++17 -arch="sm_$CUDA_ARCH" \
-    "$CUDA_CHECK_DIR/check.cu" -o "$CUDA_CHECK_DIR/check"
-rm -rf "$CUDA_CHECK_DIR"
-echo "[FreezeV2-Re] nvcc host-compiler smoke test: OK"
 
 TORCH_VERSION_AFTER="$(python - <<'PY'
 import torch
@@ -159,15 +108,66 @@ import torch
 print(torch.version.cuda)
 PY
 )"
-
 if [[ "$TORCH_VERSION_AFTER" != "$TORCH_VERSION_BEFORE" || "$TORCH_CUDA_AFTER" != "$TORCH_CUDA_BEFORE" ]]; then
     cat >&2 <<EOF
-[FreezeV2-Re] Refusing to continue: installing the CUDA toolkit changed PyTorch.
+[FreezeV2-Re] Refusing to continue: dependency installation changed PyTorch.
 before: torch=$TORCH_VERSION_BEFORE CUDA=$TORCH_CUDA_BEFORE
 after:  torch=$TORCH_VERSION_AFTER CUDA=$TORCH_CUDA_AFTER
 EOF
     exit 2
 fi
+
+export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
+export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
+export PATH="$CUDA_HOME/bin:$PATH"
+CUDA_TARGET_ROOT="${FREEZEV2_CUDA_TARGET_ROOT:-$CONDA_PREFIX/targets/x86_64-linux}"
+CUDA_INCLUDE_DIR="$CUDA_TARGET_ROOT/include"
+CUDA_LIBRARY_DIR="$CUDA_TARGET_ROOT/lib"
+GL_INCLUDE_DIR="$CONDA_PREFIX/include"
+GL_LIBRARY_DIR="$CONDA_PREFIX/lib"
+
+if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
+    echo "[FreezeV2-Re] nvcc is unavailable." >&2
+    exit 2
+fi
+if [[ ! -f "$CUDA_INCLUDE_DIR/cuda_runtime.h" || ! -d "$CUDA_LIBRARY_DIR" ]]; then
+    echo "[FreezeV2-Re] CUDA toolkit layout is incomplete under $CUDA_TARGET_ROOT" >&2
+    exit 2
+fi
+if [[ ! -f "$GL_INCLUDE_DIR/EGL/egl.h" || \
+      ! -e "$GL_LIBRARY_DIR/libEGL.so" || \
+      ! -e "$GL_LIBRARY_DIR/libOpenGL.so" ]]; then
+    echo "[FreezeV2-Re] GLVND OpenGL/EGL development files are incomplete in freeze." >&2
+    exit 2
+fi
+if [[ ! -x "$HOST_CC" || ! -x "$HOST_CXX" ]]; then
+    echo "[FreezeV2-Re] system host compiler not found: $HOST_CC / $HOST_CXX" >&2
+    exit 2
+fi
+
+unset NVCC_PREPEND_FLAGS
+export CC="$HOST_CC"
+export CXX="$HOST_CXX"
+export CUDAHOSTCXX="$HOST_CXX"
+
+echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
+echo "[FreezeV2-Re] CUDA headers: $CUDA_INCLUDE_DIR"
+echo "[FreezeV2-Re] CUDA libraries: $CUDA_LIBRARY_DIR"
+echo "[FreezeV2-Re] GLVND headers: $GL_INCLUDE_DIR"
+echo "[FreezeV2-Re] GLVND libraries: $GL_LIBRARY_DIR"
+echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
+echo "[FreezeV2-Re] CUDA host compiler: $($HOST_CXX --version | head -n 1)"
+echo "[FreezeV2-Re] CUDA architecture: sm_$CUDA_ARCH"
+
+CUDA_CHECK_DIR="$(mktemp -d)"
+cat > "$CUDA_CHECK_DIR/check.cu" <<'CU'
+#include <cuda_runtime.h>
+int main() { return 0; }
+CU
+"$NVCC_PATH" -ccbin "$HOST_CXX" -std=c++17 -arch="sm_$CUDA_ARCH" \
+    "$CUDA_CHECK_DIR/check.cu" -o "$CUDA_CHECK_DIR/check"
+rm -rf "$CUDA_CHECK_DIR"
+echo "[FreezeV2-Re] nvcc host-compiler smoke test: OK"
 
 TORCH_ABI="$(python - <<'PY'
 import torch
@@ -175,9 +175,6 @@ print("ON" if torch._C._GLIBCXX_USE_CXX11_ABI else "OFF")
 PY
 )"
 
-# Build Open3D's official PyTorch ops against the PyTorch already installed in
-# freeze. Do not install a released Open3D wheel because its torch build version
-# is unrelated to this environment.
 python -m pip install "${PIP_ARGS[@]}" "cmake>=3.24" ninja wheel setuptools
 
 if [[ ! -d "$OPEN3D_ROOT/.git" ]]; then
@@ -185,8 +182,6 @@ if [[ ! -d "$OPEN3D_ROOT/.git" ]]; then
 fi
 git -C "$OPEN3D_ROOT" fetch --all --tags
 git -C "$OPEN3D_ROOT" checkout "$OPEN3D_COMMIT"
-
-# A previous failed CMake configure caches its compiler/toolkit selection.
 rm -rf "$OPEN3D_BUILD"
 
 cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
@@ -201,8 +196,13 @@ cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
     -DCUDA_NVCC_EXECUTABLE="$NVCC_PATH" \
     -DCUDA_TOOLKIT_INCLUDE="$CUDA_INCLUDE_DIR" \
     -DCUDA_INCLUDE_DIRS="$CUDA_INCLUDE_DIR" \
-    -DCMAKE_INCLUDE_PATH="$CUDA_INCLUDE_DIR" \
-    -DCMAKE_LIBRARY_PATH="$CUDA_LIBRARY_DIR" \
+    -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+    -DCMAKE_INCLUDE_PATH="$CUDA_INCLUDE_DIR;$GL_INCLUDE_DIR" \
+    -DCMAKE_LIBRARY_PATH="$CUDA_LIBRARY_DIR;$GL_LIBRARY_DIR" \
+    -DOpenGL_ROOT="$CONDA_PREFIX" \
+    -DOPENGL_EGL_INCLUDE_DIR="$GL_INCLUDE_DIR" \
+    -DOPENGL_egl_LIBRARY="$GL_LIBRARY_DIR/libEGL.so" \
+    -DOPENGL_opengl_LIBRARY="$GL_LIBRARY_DIR/libOpenGL.so" \
     -DBUILD_SHARED_LIBS=ON \
     -DBUILD_PYTHON_MODULE=ON \
     -DBUILD_CUDA_MODULE=ON \
@@ -230,16 +230,12 @@ if [[ -z "$OPEN3D_WHEEL" || ! -f "$OPEN3D_WHEEL" ]]; then
     echo "[FreezeV2-Re] Open3D wheel was not produced." >&2
     exit 3
 fi
-
-# --no-deps is intentional: this build must not replace torch or other freeze
-# packages. The wheel contains the Open3D core and official torch ops.
 python -m pip install "${PIP_ARGS[@]}" --force-reinstall --no-deps "$OPEN3D_WHEEL"
 
 python - <<'PY'
 import open3d
 import open3d.ml.torch as ml3d
 import torch
-
 print("[FreezeV2-Re] Open3D:", open3d.__version__)
 print("[FreezeV2-Re] Open3D CUDA:", open3d._build_config["CUDA_VERSION"])
 print("[FreezeV2-Re] Open3D PyTorch:", open3d._build_config["Pytorch_VERSION"])
@@ -259,13 +255,12 @@ git -C "$GEDI_ROOT" checkout "$GEDI_COMMIT"
 
 python -m pip install "${PIP_ARGS[@]}" torchgeometry==0.1.2 gdown
 
-# GeDi vendors the official PointNet2 extension. Its old setup.py requests many
-# obsolete architectures. Restrict build metadata to the actual A800 target;
-# the PointNet2 Python API and C++/CUDA kernels are untouched.
+# GeDi vendors the official PointNet2 extension. Restrict only its build
+# architecture metadata to A800 (sm_80); Python/C++/CUDA API and kernels stay
+# unchanged.
 python - "$GEDI_ROOT/backbones/pointnet2_ops_lib/setup.py" <<'PY'
 from pathlib import Path
 import sys
-
 path = Path(sys.argv[1])
 text = path.read_text()
 old = 'os.environ["TORCH_CUDA_ARCH_LIST"] = "3.7+PTX;5.0;6.0;6.1;6.2;7.0;7.5"'
@@ -285,7 +280,6 @@ import open3d.ml.torch as ml3d
 import torch
 import torchgeometry
 from pointnet2_ops.pointnet2_modules import PointnetSAModule
-
 print("[FreezeV2-Re] GeDi runtime imports: OK")
 print("[FreezeV2-Re] PointNet2:", PointnetSAModule)
 print("[FreezeV2-Re] radius_search:", ml3d.ops.radius_search)
