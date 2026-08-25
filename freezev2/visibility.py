@@ -8,11 +8,12 @@ from .geometry import project_points
 from .onboard import Template, map_visible_pixels_to_query_points
 
 
-def _bilinear_visible_ids(
+def _subpixel_visible_ids(
     query_points: np.ndarray,
     template: Template,
     depth_tolerance: float,
     image_hw: tuple[int, int],
+    inverse_depth: bool,
 ) -> np.ndarray:
     """Return visible point ids using sub-pixel rendered-depth interpolation."""
     depth = np.asarray(template.depth, dtype=np.float64)
@@ -67,16 +68,29 @@ def _bilinear_visible_ids(
     )
 
     # Background depth is zero. Ignore such neighbours and renormalize the
-    # remaining bilinear weights so silhouettes do not interpolate toward zero.
+    # remaining interpolation weights so silhouettes do not mix with zero.
     valid_depth = samples > 0
     weights = np.where(valid_depth, weights, 0.0)
     weight_sum = weights.sum(axis=1)
-    rendered_z = np.zeros(len(ids), dtype=np.float64)
     has_depth = weight_sum > 0
-    rendered_z[has_depth] = (
-        (samples[has_depth] * weights[has_depth]).sum(axis=1)
-        / weight_sum[has_depth]
-    )
+    rendered_z = np.zeros(len(ids), dtype=np.float64)
+
+    if inverse_depth:
+        inverse_samples = np.zeros_like(samples)
+        inverse_samples[valid_depth] = 1.0 / samples[valid_depth]
+        rendered_inv_z = np.zeros(len(ids), dtype=np.float64)
+        rendered_inv_z[has_depth] = (
+            (inverse_samples[has_depth] * weights[has_depth]).sum(axis=1)
+            / weight_sum[has_depth]
+        )
+        positive = has_depth & (rendered_inv_z > 0)
+        rendered_z[positive] = 1.0 / rendered_inv_z[positive]
+        has_depth = positive
+    else:
+        rendered_z[has_depth] = (
+            (samples[has_depth] * weights[has_depth]).sum(axis=1)
+            / weight_sum[has_depth]
+        )
 
     visible = has_depth & (np.abs(rendered_z - z[ids]) <= depth_tolerance)
     return ids[visible]
@@ -92,8 +106,14 @@ def query_visibility_counts(
     """Count in how many rendered views each query point is visible.
 
     ``sampling='nearest'`` preserves the original diagnostic based on the
-    rounded projected pixel. ``sampling='bilinear'`` interpolates rendered depth
-    at the continuous projected coordinate and ignores zero-depth neighbours.
+    rounded projected pixel. ``sampling='bilinear'`` interpolates metric depth
+    at the continuous projected coordinate. ``sampling='inverse_bilinear'``
+    interpolates ``1 / depth`` before inverting back to metric z, matching the
+    perspective-correct depth behavior of a planar triangle more closely.
+
+    Sub-pixel modes ignore zero-depth neighbours and renormalize the remaining
+    weights. These modes are diagnostic only; the production feature aggregation
+    path is unchanged until the geometry is validated on real templates.
 
     ``feature_image_hws`` optionally restricts visibility to the image region
     actually consumed by the visual backbone. For ViT-g/14 on the paper's
@@ -107,8 +127,10 @@ def query_visibility_counts(
         raise ValueError("depth_tolerance must be non-negative")
     if feature_image_hws is not None and len(feature_image_hws) != len(templates):
         raise ValueError("feature_image_hws must contain one size per template")
-    if sampling not in {"nearest", "bilinear"}:
-        raise ValueError("sampling must be 'nearest' or 'bilinear'")
+    if sampling not in {"nearest", "bilinear", "inverse_bilinear"}:
+        raise ValueError(
+            "sampling must be 'nearest', 'bilinear', or 'inverse_bilinear'"
+        )
 
     counts = np.zeros(len(query_points), dtype=np.int32)
     for view_id, template in enumerate(templates):
@@ -118,12 +140,13 @@ def query_visibility_counts(
             else tuple(map(int, feature_image_hws[view_id]))
         )
 
-        if sampling == "bilinear":
-            ids = _bilinear_visible_ids(
+        if sampling in {"bilinear", "inverse_bilinear"}:
+            ids = _subpixel_visible_ids(
                 query_points,
                 template,
                 depth_tolerance=depth_tolerance,
                 image_hw=image_hw,
+                inverse_depth=sampling == "inverse_bilinear",
             )
         else:
             ids, pixels = map_visible_pixels_to_query_points(
