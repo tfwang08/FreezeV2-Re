@@ -10,16 +10,33 @@ set -eo pipefail
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
 
-TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-2.2.2+cu121}"
-TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-0.17.2+cu121}"
-TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-2.2.2+cu121}"
+# Request the public PyTorch release versions here. The CUDA local-version
+# suffix (+cu121) is supplied by the wheel selected from the cu121 index and is
+# verified after installation.
+TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-2.2.2}"
+TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-0.17.2}"
+TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-2.2.2}"
 NUMPY_VERSION="${FREEZEV2_NUMPY_VERSION:-1.26.4}"
 OPEN3D_VERSION="${FREEZEV2_OPEN3D_VERSION:-0.19.0}"
 
 PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
 PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
 PYTORCH_INDEX_URL="${FREEZEV2_PYTORCH_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pytorch-wheels/cu121}"
-PIP_ARGS=(-i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST")
+
+# The cluster image may inject extra pip indexes (for example NVIDIA NGC) via
+# environment variables or pip config. Keep this setup deterministic and avoid
+# DNS retries to unrelated indexes: every pip invocation below starts from a
+# clean pip configuration and uses only indexes explicitly supplied here.
+_pip_clean() {
+    env \
+        -u PIP_INDEX_URL \
+        -u PIP_EXTRA_INDEX_URL \
+        -u PIP_TRUSTED_HOST \
+        -u PIP_NO_INDEX \
+        -u PIP_FIND_LINKS \
+        PIP_CONFIG_FILE=/dev/null \
+        python -m pip "$@"
+}
 
 _load_conda() {
     if declare -F conda >/dev/null 2>&1; then
@@ -63,11 +80,11 @@ PY
 
 echo "[FreezeV2-Re] switching freeze to the released Open3D-compatible binary stack."
 echo "[FreezeV2-Re] PyTorch index: $PYTORCH_INDEX_URL"
+echo "[FreezeV2-Re] PyPI index: $PIP_INDEX_URL"
 
-# PyTorch 2.2.2 provides a CPython 3.12 CUDA 12.1 wheel. Use the binary wheel
-# index directly; do not keep the CUDA 13 PyTorch build because Open3D 0.19.0's
-# released ML ops reject PyTorch versions outside 2.2.*.
-python -m pip install \
+# PyTorch's official CUDA 12.1 install command requests 2.2.2 / 0.17.2 /
+# 2.2.2 from the cu121 index. The installed wheel reports 2.2.2+cu121.
+_pip_clean install \
     --force-reinstall \
     --no-cache-dir \
     --index-url "$PYTORCH_INDEX_URL" \
@@ -79,7 +96,9 @@ python -m pip install \
 
 # Open3D 0.19.0 was built against NumPy 1.x. Pin NumPy before installing the
 # released wheel so pip does not leave a NumPy 2.x runtime in the environment.
-python -m pip install "${PIP_ARGS[@]}" \
+_pip_clean install \
+    --index-url "$PIP_INDEX_URL" \
+    --trusted-host "$PIP_TRUSTED_HOST" \
     --upgrade \
     "numpy==$NUMPY_VERSION" \
     "open3d==$OPEN3D_VERSION" \
@@ -146,7 +165,7 @@ EOF
     exit 4
 fi
 
-python -m pip install "${PIP_ARGS[@]}" --no-deps "$POINTNET2_WHEEL"
+_pip_clean install --no-deps "$POINTNET2_WHEEL"
 
 # Verify that the supplied binary actually loads against this exact PyTorch/CUDA
 # runtime and can execute one CUDA PointNet2 kernel.
