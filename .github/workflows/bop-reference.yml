@@ -8,10 +8,13 @@ on:
       - "freezev2/bop.py"
       - "freezev2/geometry.py"
       - "freezev2/onboard.py"
+      - "freezev2/gedi_bridge.py"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
       - "tests/test_onboard.py"
+      - "tests/test_gedi_bridge.py"
+      - "tests/test_run_bop.py"
   pull_request:
     branches: [main]
     paths:
@@ -19,10 +22,13 @@ on:
       - "freezev2/bop.py"
       - "freezev2/geometry.py"
       - "freezev2/onboard.py"
+      - "freezev2/gedi_bridge.py"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
       - "tests/test_onboard.py"
+      - "tests/test_gedi_bridge.py"
+      - "tests/test_run_bop.py"
   workflow_dispatch:
 
 jobs:
