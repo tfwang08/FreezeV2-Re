@@ -59,3 +59,49 @@ def query_visibility_counts(
         counts[ids] += 1
 
     return counts
+
+
+def select_visible_query_points(
+    raw_query_points: np.ndarray,
+    templates: Sequence[Template],
+    depth_tolerance: float,
+    final_count: int = 5000,
+    min_views: int = 18,
+    feature_image_hws: Sequence[tuple[int, int]] | None = None,
+    sampling: str = "inverse_bilinear",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter a raw Poisson cloud by visibility and keep exactly ``final_count``.
+
+    FreeZeV2 specifies a raw query cloud, a visibility threshold of 18 views,
+    and a final 5k-point query cloud, but does not publish ``N_Q^raw``. The raw
+    count therefore stays an explicit caller-side reproduction parameter.
+
+    Selection preserves the original raw Poisson order rather than ranking by
+    visibility, which would bias the final cloud toward easy-to-see surfaces.
+    If too few points survive, the caller must increase the explicit raw count;
+    this function never relaxes ``min_views`` or ``depth_tolerance``.
+    """
+    raw_query_points = np.asarray(raw_query_points, dtype=np.float64)
+    if raw_query_points.ndim != 2 or raw_query_points.shape[1] != 3:
+        raise ValueError("raw_query_points must have shape Nx3")
+    if final_count <= 0:
+        raise ValueError("final_count must be positive")
+    if min_views <= 0:
+        raise ValueError("min_views must be positive")
+
+    counts = query_visibility_counts(
+        raw_query_points,
+        templates,
+        depth_tolerance=depth_tolerance,
+        feature_image_hws=feature_image_hws,
+        sampling=sampling,
+    )
+    visible_ids = np.flatnonzero(counts >= int(min_views))
+    if len(visible_ids) < int(final_count):
+        raise ValueError(
+            f"only {len(visible_ids)} raw query points are visible in at least "
+            f"{min_views} views; need {final_count}"
+        )
+
+    selected_ids = visible_ids[: int(final_count)]
+    return raw_query_points[selected_ids].copy(), counts[selected_ids].copy()
