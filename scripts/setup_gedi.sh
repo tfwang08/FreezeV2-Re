@@ -46,6 +46,25 @@ if torch.cuda.is_available():
 print("[FreezeV2-Re] CXX11 ABI:", torch._C._GLIBCXX_USE_CXX11_ABI)
 PY
 
+TORCH_MM="$(python - <<'PY'
+import torch
+v = torch.__version__.split('+', 1)[0].split('.')
+print('.'.join(v[:2]))
+PY
+)"
+
+if [[ "$TORCH_MM" != "2.2" && "${FREEZEV2_OPEN3D_READY:-0}" != "1" ]]; then
+    cat >&2 <<EOF
+[FreezeV2-Re] STOP before modifying the freeze environment.
+The Open3D 0.19 PyPI wheel exposes open3d.ml.torch against PyTorch 2.2.x,
+but the current freeze environment has PyTorch $TORCH_MM.
+
+Do not downgrade torch. Build Open3D PyTorch ops against the current freeze
+PyTorch first; after that rerun with FREEZEV2_OPEN3D_READY=1.
+EOF
+    exit 2
+fi
+
 if [[ ! -d "$GEDI_ROOT/.git" ]]; then
     git clone https://github.com/fabiopoiesi/gedi.git "$GEDI_ROOT"
 fi
@@ -55,25 +74,7 @@ git -C "$GEDI_ROOT" checkout "$GEDI_COMMIT"
 python -m pip install --upgrade setuptools wheel ninja
 python -m pip install torchgeometry==0.1.2 gdown
 
-TORCH_MM="$(python - <<'PY'
-import torch
-v = torch.__version__.split('+', 1)[0].split('.')
-print('.'.join(v[:2]))
-PY
-)"
-
-if [[ "$TORCH_MM" != "2.2" ]]; then
-    cat >&2 <<EOF
-[FreezeV2-Re] STOP: the Open3D 0.19 PyPI wheel exposes open3d.ml.torch
-against PyTorch 2.2.x, but the current freeze environment has PyTorch $TORCH_MM.
-
-Do not downgrade torch. Build Open3D PyTorch ops against the current freeze
-PyTorch instead, then rerun this script with FREEZEV2_OPEN3D_READY=1.
-EOF
-    if [[ "${FREEZEV2_OPEN3D_READY:-0}" != "1" ]]; then
-        exit 2
-    fi
-else
+if [[ "$TORCH_MM" == "2.2" ]]; then
     python -m pip install open3d==0.19.0
 fi
 
