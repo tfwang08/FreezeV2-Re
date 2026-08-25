@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
+
 from freezev2.bop import (
     BOP_TOOLKIT_COMMIT,
     REFERENCE_SUBMISSIONS,
@@ -11,6 +13,7 @@ from freezev2.bop import (
     evaluate_reference,
     prepare_bop_dataset,
 )
+from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
 
 
 def main() -> None:
@@ -34,6 +37,23 @@ def main() -> None:
     evaluate.add_argument("--eval-root", type=Path, default=Path("outputs/bop_eval"))
     evaluate.add_argument("--num-workers", type=int, default=10)
 
+    gedi = subparsers.add_parser(
+        "extract-query-gedi",
+        help="Extract two-scale GeDi descriptors for an onboarded CAD object",
+    )
+    gedi.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    gedi.add_argument("--obj-id", type=int, required=True)
+    gedi.add_argument("--bop-root", type=Path, default=Path("data/bop"))
+    gedi.add_argument("--onboarding-cache", type=Path)
+    gedi.add_argument("--gedi-root", type=Path, default=Path("external/gedi"))
+    gedi.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("external/gedi/data/chkpts/3dmatch/chkpt.tar"),
+    )
+    gedi.add_argument("--output", type=Path)
+    gedi.add_argument("--seed", type=int, default=0)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -42,6 +62,79 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "extract-query-gedi":
+        if args.obj_id <= 0:
+            raise ValueError("--obj-id must be positive")
+
+        models_info_path = (
+            args.bop_root / args.dataset / "models" / "models_info.json"
+        )
+        models_info = json.loads(models_info_path.read_text())
+        object_info = models_info.get(str(args.obj_id))
+        if object_info is None or "diameter" not in object_info:
+            raise KeyError(
+                f"object {args.obj_id} has no diameter in {models_info_path}"
+            )
+        diameter = float(object_info["diameter"])
+        if diameter <= 0:
+            raise ValueError("object diameter must be positive")
+
+        cache_path = args.onboarding_cache or (
+            Path("outputs/onboard")
+            / f"{args.dataset}_obj_{args.obj_id:06d}"
+            / "onboarding.npz"
+        )
+        with np.load(cache_path, allow_pickle=False) as cache:
+            if "query_points" not in cache:
+                raise KeyError(f"query_points missing from {cache_path}")
+            query_points = np.asarray(cache["query_points"], dtype=np.float32)
+
+        extractor = GediExtractor(
+            checkpoint=args.checkpoint,
+            gedi_root=args.gedi_root,
+            seed=args.seed,
+        )
+        geometric = extractor.encode(
+            query_points,
+            query_points,
+            object_diameter=diameter,
+        )
+        if geometric.shape != (len(query_points), 64):
+            raise RuntimeError(f"unexpected fused GeDi shape: {geometric.shape}")
+
+        radii = np.asarray(
+            [scale * diameter for scale in GEDI_SCALES],
+            dtype=np.float32,
+        )
+        output = args.output or (
+            Path("outputs/features")
+            / f"{args.dataset}_obj_{args.obj_id:06d}_gedi.npz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            query_points=query_points,
+            geometric_features_30=geometric[:, :32],
+            geometric_features_40=geometric[:, 32:],
+            geometric_features=geometric,
+            scales=np.asarray(GEDI_SCALES, dtype=np.float32),
+            radii=radii,
+            diameter=np.float32(diameter),
+            seed=np.int32(args.seed),
+            gedi_commit=np.array(GEDI_REPO_COMMIT),
+        )
+        print(json.dumps({
+            "dataset": args.dataset,
+            "obj_id": args.obj_id,
+            "diameter": diameter,
+            "query_points": list(query_points.shape),
+            "geometric_features": list(geometric.shape),
+            "radii": radii.tolist(),
+            "finite": bool(np.isfinite(geometric).all()),
+            "output": str(output),
+        }, indent=2, sort_keys=True))
         return
 
     spec = REFERENCE_SUBMISSIONS[args.dataset]
