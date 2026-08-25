@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Extract the two FreeZe GeDi scales using the pinned official GeDi repository.
 
-This script is intentionally standalone so it can run in the legacy GeDi Python
-environment without installing the main FreezeV2-Re package.
+Run this inside the existing ``freeze`` environment. The script imports and
+uses the official GeDi implementation directly, including its Open3D ML radius
+search and PointNet2 CUDA operators.
 """
 
 import argparse
