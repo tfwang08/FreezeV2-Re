@@ -4,7 +4,82 @@ from typing import Sequence
 
 import numpy as np
 
+from .geometry import project_points
 from .onboard import Template, map_visible_pixels_to_query_points
+
+
+def _bilinear_visible_ids(
+    query_points: np.ndarray,
+    template: Template,
+    depth_tolerance: float,
+    image_hw: tuple[int, int],
+) -> np.ndarray:
+    """Return visible point ids using sub-pixel rendered-depth interpolation."""
+    depth = np.asarray(template.depth, dtype=np.float64)
+    image_h = min(int(image_hw[0]), depth.shape[0])
+    image_w = min(int(image_hw[1]), depth.shape[1])
+
+    uv, z = project_points(
+        query_points,
+        template.camera.K,
+        template.camera.R,
+        template.camera.t,
+    )
+    finite = np.isfinite(uv).all(axis=1)
+    inside = (
+        finite
+        & (z > 0)
+        & (uv[:, 0] >= 0.0)
+        & (uv[:, 0] <= image_w - 1)
+        & (uv[:, 1] >= 0.0)
+        & (uv[:, 1] <= image_h - 1)
+    )
+    ids = np.flatnonzero(inside)
+    if len(ids) == 0:
+        return ids
+
+    u = uv[ids, 0]
+    v = uv[ids, 1]
+    x0 = np.floor(u).astype(np.int64)
+    y0 = np.floor(v).astype(np.int64)
+    x1 = np.minimum(x0 + 1, image_w - 1)
+    y1 = np.minimum(y0 + 1, image_h - 1)
+    wx = u - x0
+    wy = v - y0
+
+    samples = np.stack(
+        [
+            depth[y0, x0],
+            depth[y0, x1],
+            depth[y1, x0],
+            depth[y1, x1],
+        ],
+        axis=1,
+    )
+    weights = np.stack(
+        [
+            (1.0 - wx) * (1.0 - wy),
+            wx * (1.0 - wy),
+            (1.0 - wx) * wy,
+            wx * wy,
+        ],
+        axis=1,
+    )
+
+    # Background depth is zero. Ignore such neighbours and renormalize the
+    # remaining bilinear weights so silhouettes do not interpolate toward zero.
+    valid_depth = samples > 0
+    weights = np.where(valid_depth, weights, 0.0)
+    weight_sum = weights.sum(axis=1)
+    rendered_z = np.zeros(len(ids), dtype=np.float64)
+    has_depth = weight_sum > 0
+    rendered_z[has_depth] = (
+        (samples[has_depth] * weights[has_depth]).sum(axis=1)
+        / weight_sum[has_depth]
+    )
+
+    visible = has_depth & (np.abs(rendered_z - z[ids]) <= depth_tolerance)
+    return ids[visible]
 
 
 def query_visibility_counts(
@@ -12,8 +87,13 @@ def query_visibility_counts(
     templates: Sequence[Template],
     depth_tolerance: float,
     feature_image_hws: Sequence[tuple[int, int]] | None = None,
+    sampling: str = "nearest",
 ) -> np.ndarray:
     """Count in how many rendered views each query point is visible.
+
+    ``sampling='nearest'`` preserves the original diagnostic based on the
+    rounded projected pixel. ``sampling='bilinear'`` interpolates rendered depth
+    at the continuous projected coordinate and ignores zero-depth neighbours.
 
     ``feature_image_hws`` optionally restricts visibility to the image region
     actually consumed by the visual backbone. For ViT-g/14 on the paper's
@@ -27,27 +107,40 @@ def query_visibility_counts(
         raise ValueError("depth_tolerance must be non-negative")
     if feature_image_hws is not None and len(feature_image_hws) != len(templates):
         raise ValueError("feature_image_hws must contain one size per template")
+    if sampling not in {"nearest", "bilinear"}:
+        raise ValueError("sampling must be 'nearest' or 'bilinear'")
 
     counts = np.zeros(len(query_points), dtype=np.int32)
     for view_id, template in enumerate(templates):
-        ids, pixels = map_visible_pixels_to_query_points(
-            query_points,
-            template.depth,
-            template.camera,
-            depth_tolerance=depth_tolerance,
+        image_hw = (
+            tuple(map(int, template.depth.shape[:2]))
+            if feature_image_hws is None
+            else tuple(map(int, feature_image_hws[view_id]))
         )
-        if len(ids) == 0:
-            continue
 
-        if feature_image_hws is not None:
-            image_h, image_w = map(int, feature_image_hws[view_id])
-            inside = (
-                (pixels[:, 0] >= 0)
-                & (pixels[:, 0] < image_w)
-                & (pixels[:, 1] >= 0)
-                & (pixels[:, 1] < image_h)
+        if sampling == "bilinear":
+            ids = _bilinear_visible_ids(
+                query_points,
+                template,
+                depth_tolerance=depth_tolerance,
+                image_hw=image_hw,
             )
-            ids = ids[inside]
+        else:
+            ids, pixels = map_visible_pixels_to_query_points(
+                query_points,
+                template.depth,
+                template.camera,
+                depth_tolerance=depth_tolerance,
+            )
+            if len(ids) and feature_image_hws is not None:
+                image_h, image_w = image_hw
+                inside = (
+                    (pixels[:, 0] >= 0)
+                    & (pixels[:, 0] < image_w)
+                    & (pixels[:, 1] >= 0)
+                    & (pixels[:, 1] < image_h)
+                )
+                ids = ids[inside]
 
         counts[ids] += 1
 
