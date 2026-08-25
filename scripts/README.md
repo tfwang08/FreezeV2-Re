@@ -36,18 +36,21 @@ Do not execute these scripts as child processes (`bash scripts/use_*.sh`); envir
 
 ## GeDi binary stack
 
-GeDi setup is **prebuilt-only**. `scripts/setup_gedi.sh` does not compile Open3D or PointNet2.
+GeDi setup is **prebuilt-only**. `scripts/setup_gedi.sh` does not compile Open3D or PointNet2 and has no source/JIT fallback.
 
-The released Open3D 0.19.0 wheel requires PyTorch 2.2.*, so the `freeze` environment is intentionally pinned to:
+The `freeze` environment is intentionally pinned to:
 
 ```text
-Python       3.12
+Python       3.11
 PyTorch      2.2.2+cu121
 torchvision  0.17.2+cu121
 torchaudio   2.2.2+cu121
 NumPy        1.26.4
 Open3D       0.19.0
+PointNet2    3.0.0
 ```
+
+Python 3.11 is required by the matching prebuilt PointNet2 wheel. The selected wheel was built with PyTorch 2.2.2 / CUDA 12.1 and includes `sm_80`; its PointNet2 CUDA/C++ sources match the ops vendored by the pinned GeDi repository.
 
 Run:
 
@@ -56,13 +59,31 @@ source scripts/use_freeze.sh
 bash scripts/setup_gedi.sh
 ```
 
-The script installs the released PyTorch/Open3D wheels and verifies that `open3d.ml.torch.ops.radius_search` loads with CUDA.
+On the first run the setup script may change the existing `freeze` environment from Python 3.12 to Python 3.11, then reinstall the released binary stack. Later runs skip that work when the exact versions already pass their smoke tests.
 
-Official GeDi vendors a PointNet2 CUDA extension but does not ship a matching prebuilt wheel for the pinned Python/PyTorch/CUDA stack. The setup script therefore stops instead of compiling it. Once an exact compatible wheel is identified, pass it explicitly:
+The default PointNet2 wheel is:
+
+```text
+https://github.com/YanWenKun/ComfyUI-3D-Pack-LinuxWheels/releases/download/v2/pointnet2_ops-3.0.0-cp311-cp311-linux_x86_64.whl
+```
+
+Override it with a local copy when needed:
 
 ```bash
-export FREEZEV2_POINTNET2_WHEEL=/path/to/pointnet2_ops.whl
+export FREEZEV2_POINTNET2_WHEEL=/path/to/pointnet2_ops-3.0.0-cp311-cp311-linux_x86_64.whl
 bash scripts/setup_gedi.sh
 ```
 
-The supplied PointNet2 wheel is accepted only after its CUDA extension imports and executes a CUDA smoke test.
+The official GeDi checkpoint is a local input because cluster nodes may not reach Google Drive. By default it must be at:
+
+```text
+external/gedi/data/chkpts/3dmatch/chkpt.tar
+```
+
+or can be supplied with:
+
+```bash
+export FREEZEV2_GEDI_CHECKPOINT=/path/to/chkpt.tar
+```
+
+Setup verifies the checkpoint key, Open3D CUDA/`radius_search`, a PointNet2 CUDA kernel, and finally computes a small 32-D GeDi descriptor batch end to end.
