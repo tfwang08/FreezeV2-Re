@@ -1,7 +1,8 @@
 import numpy as np
+import pytest
 
 from freezev2.onboard import CameraPose, Template
-from freezev2.visibility import query_visibility_counts
+from freezev2.visibility import query_visibility_counts, select_visible_query_points
 
 
 def test_visibility_counts_respect_depth_and_feature_crop():
@@ -94,3 +95,33 @@ def test_visibility_counts_support_perspective_correct_subpixel_depth():
     )
 
     assert counts.tolist() == [1]
+
+
+def test_select_visible_query_points_preserves_raw_order_and_requires_enough(monkeypatch):
+    raw = np.arange(18, dtype=np.float64).reshape(6, 3)
+    all_counts = np.array([20, 3, 19, 18, 17, 40], dtype=np.int32)
+
+    monkeypatch.setattr(
+        "freezev2.visibility.query_visibility_counts",
+        lambda *args, **kwargs: all_counts.copy(),
+    )
+
+    points, counts = select_visible_query_points(
+        raw,
+        [],
+        depth_tolerance=0.1,
+        final_count=3,
+        min_views=18,
+    )
+
+    np.testing.assert_allclose(points, raw[[0, 2, 3]])
+    assert counts.tolist() == [20, 19, 18]
+
+    with pytest.raises(ValueError, match="only 4 raw query points"):
+        select_visible_query_points(
+            raw,
+            [],
+            depth_tolerance=0.1,
+            final_count=5,
+            min_views=18,
+        )
