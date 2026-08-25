@@ -1,10 +1,16 @@
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
 
-import run_bop
+
+_RUN_BOP_PATH = Path(__file__).resolve().parents[1] / "run_bop.py"
+_RUN_BOP_SPEC = importlib.util.spec_from_file_location("run_bop", _RUN_BOP_PATH)
+assert _RUN_BOP_SPEC is not None and _RUN_BOP_SPEC.loader is not None
+run_bop = importlib.util.module_from_spec(_RUN_BOP_SPEC)
+_RUN_BOP_SPEC.loader.exec_module(run_bop)
 
 
 def test_extract_query_gedi_reads_model_diameter_and_saves_64d(
