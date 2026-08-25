@@ -16,6 +16,9 @@ BUILD_JOBS="${FREEZEV2_BUILD_JOBS:-8}"
 PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
 PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
 PIP_ARGS=(-i "$PIP_INDEX_URL" --trusted-host "$PIP_TRUSTED_HOST")
+HOST_CC="${FREEZEV2_HOST_CC:-/usr/bin/gcc}"
+HOST_CXX="${FREEZEV2_HOST_CXX:-/usr/bin/g++}"
+CUDA_ARCH="${FREEZEV2_CUDA_ARCH:-80}"
 
 _load_conda() {
     if declare -F conda >/dev/null 2>&1; then
@@ -101,8 +104,36 @@ if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
     exit 2
 fi
 
+if [[ ! -x "$HOST_CC" || ! -x "$HOST_CXX" ]]; then
+    echo "[FreezeV2-Re] system host compiler not found: $HOST_CC / $HOST_CXX" >&2
+    exit 2
+fi
+
+# Conda's compiler activation hook may inject NVCC_PREPEND_FLAGS=-ccbin=<conda
+# compiler>. With CUDA 13 + the conda GCC 14/sysroot pair this produces math.h
+# declaration conflicts before Open3D itself is compiled. Keep the conda Python
+# environment, but use the system compiler as nvcc's host compiler.
+unset NVCC_PREPEND_FLAGS
+export CC="$HOST_CC"
+export CXX="$HOST_CXX"
+export CUDAHOSTCXX="$HOST_CXX"
+
 echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
 echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
+echo "[FreezeV2-Re] CUDA host compiler: $($HOST_CXX --version | head -n 1)"
+echo "[FreezeV2-Re] CUDA architecture: sm_$CUDA_ARCH"
+
+# Fail fast before the much larger Open3D configure/build if nvcc and the
+# selected host compiler cannot compile together.
+CUDA_CHECK_DIR="$(mktemp -d)"
+cat > "$CUDA_CHECK_DIR/check.cu" <<'CU'
+#include <cuda_runtime.h>
+int main() { return 0; }
+CU
+"$NVCC_PATH" -ccbin "$HOST_CXX" -std=c++17 -arch="sm_$CUDA_ARCH" \
+    "$CUDA_CHECK_DIR/check.cu" -o "$CUDA_CHECK_DIR/check"
+rm -rf "$CUDA_CHECK_DIR"
+echo "[FreezeV2-Re] nvcc host-compiler smoke test: OK"
 
 TORCH_VERSION_AFTER="$(python - <<'PY'
 import torch
@@ -141,9 +172,17 @@ fi
 git -C "$OPEN3D_ROOT" fetch --all --tags
 git -C "$OPEN3D_ROOT" checkout "$OPEN3D_COMMIT"
 
+# A previous failed CMake configure caches its compiler selection. Recreate this
+# dedicated build directory so the explicit system host compiler takes effect.
+rm -rf "$OPEN3D_BUILD"
+
 cmake -S "$OPEN3D_ROOT" -B "$OPEN3D_BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="$HOST_CC" \
+    -DCMAKE_CXX_COMPILER="$HOST_CXX" \
     -DCMAKE_CUDA_COMPILER="$NVCC_PATH" \
+    -DCMAKE_CUDA_HOST_COMPILER="$HOST_CXX" \
+    -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
     -DCUDAToolkit_ROOT="$CUDA_HOME" \
     -DBUILD_SHARED_LIBS=ON \
     -DBUILD_PYTHON_MODULE=ON \
@@ -200,10 +239,9 @@ git -C "$GEDI_ROOT" checkout "$GEDI_COMMIT"
 
 python -m pip install "${PIP_ARGS[@]}" torchgeometry==0.1.2 gdown
 
-# GeDi vendors the official PointNet2 extension. Its 2022 setup.py hard-codes
-# CUDA architectures 3.7..7.5, which CUDA 13 can no longer compile. This patch
-# changes build metadata only: the PointNet2 Python API and CUDA/C++ kernels are
-# untouched. A800 is compute capability 8.0.
+# GeDi vendors the official PointNet2 extension. Its old setup.py requests many
+# obsolete architectures. Restrict build metadata to the actual A800 target;
+# the PointNet2 Python API and C++/CUDA kernels are untouched.
 python - "$GEDI_ROOT/backbones/pointnet2_ops_lib/setup.py" <<'PY'
 from pathlib import Path
 import sys
