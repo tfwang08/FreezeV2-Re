@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
+import freezev2.gedi_bridge as gedi_bridge
 from freezev2.gedi_bridge import (
     GEDI_REPO_COMMIT,
     build_gedi_config,
@@ -34,3 +35,65 @@ def test_gedi_scale_concatenation_is_64d_and_ordered_30_then_40():
 
 def test_official_gedi_revision_is_pinned():
     assert GEDI_REPO_COMMIT == "b3dd86776750d8221f89d39975118da9839b39f7"
+
+
+class _FakeTensor:
+    def __init__(self, array):
+        self.array = np.asarray(array)
+
+    def float(self):
+        return self
+
+
+class _FakeCuda:
+    def is_available(self):
+        return True
+
+    def manual_seed_all(self, seed):
+        pass
+
+    def empty_cache(self):
+        pass
+
+
+class _FakeTorch:
+    cuda = _FakeCuda()
+
+    def manual_seed(self, seed):
+        pass
+
+    def from_numpy(self, array):
+        return _FakeTensor(array)
+
+
+class _FakeGeDi:
+    configs = []
+
+    def __init__(self, config):
+        self.config = config
+        self.__class__.configs.append(config)
+
+    def compute(self, pts, pcd):
+        assert pcd.array.shape[1] == 3
+        return np.full(
+            (len(pts.array), 32),
+            self.config["r_lrf"],
+            dtype=np.float32,
+        )
+
+
+def test_gedi_extractor_runs_two_freeze_scales_and_returns_64d():
+    _FakeGeDi.configs.clear()
+    points = np.arange(15, dtype=np.float32).reshape(5, 3)
+
+    extractor = gedi_bridge.GediExtractor(
+        checkpoint="checkpoint.tar",
+        gedi_root="external/gedi",
+        backend=(_FakeTorch(), _FakeGeDi),
+    )
+    features = extractor.encode(points, points, object_diameter=100.0)
+
+    assert features.shape == (5, 64)
+    np.testing.assert_allclose(features[:, :32], 30.0)
+    np.testing.assert_allclose(features[:, 32:], 40.0)
+    assert [cfg["r_lrf"] for cfg in _FakeGeDi.configs] == [30.0, 40.0]
