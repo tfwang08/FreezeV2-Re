@@ -7,6 +7,7 @@ set -eo pipefail
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 OPEN3D_COMMIT="22a6a307b9b7d88604895f79c0ceeecef2fc6538"
 CUDA_TOOLKIT_VERSION="${FREEZEV2_CUDA_TOOLKIT_VERSION:-13.0.2}"
+CUDA_CULIBOS_VERSION="${FREEZEV2_CUDA_CULIBOS_VERSION:-13.0.85}"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
 OPEN3D_ROOT="${FREEZEV2_OPEN3D_ROOT:-external/open3d}"
 OPEN3D_BUILD="${FREEZEV2_OPEN3D_BUILD:-$OPEN3D_ROOT/build-freeze}"
@@ -84,6 +85,19 @@ if [[ -z "$NVCC_PATH" ]]; then
     fi
 fi
 
+# CUDA 13 conda toolkit installs shared developer libraries but does not
+# necessarily include cuLIBOS, which CMake exposes as CUDA::culibos. Open3D's
+# official CUDA linkage keeps this target even when BUILD_WITH_CUDA_STATIC=OFF.
+# Install NVIDIA's matching cuLIBOS package rather than patching Open3D.
+CUDA_TARGET_ROOT="${FREEZEV2_CUDA_TARGET_ROOT:-$CONDA_PREFIX/targets/x86_64-linux}"
+CUDA_LIBRARY_DIR="$CUDA_TARGET_ROOT/lib"
+if [[ ! -f "$CUDA_LIBRARY_DIR/libculibos.a" ]]; then
+    echo "[FreezeV2-Re] installing NVIDIA CUDA cuLIBOS $CUDA_CULIBOS_VERSION into freeze."
+    conda install -y -n freeze -c "nvidia/label/cuda-$CUDA_TOOLKIT_VERSION" --freeze-installed \
+        "cuda-culibos-static=$CUDA_CULIBOS_VERSION"
+    hash -r
+fi
+
 # Open3D's core library always includes legacy visualization on Linux and
 # therefore requires OpenGL/EGL development files even when BUILD_GUI=OFF.
 # Install GLVND (vendor-neutral dispatch) development packages, not Mesa.
@@ -120,9 +134,7 @@ fi
 export CUDA_HOME="${CUDA_HOME:-$CONDA_PREFIX}"
 export CUDAToolkit_ROOT="${CUDAToolkit_ROOT:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
-CUDA_TARGET_ROOT="${FREEZEV2_CUDA_TARGET_ROOT:-$CONDA_PREFIX/targets/x86_64-linux}"
 CUDA_INCLUDE_DIR="$CUDA_TARGET_ROOT/include"
-CUDA_LIBRARY_DIR="$CUDA_TARGET_ROOT/lib"
 GL_INCLUDE_DIR="$CONDA_PREFIX/include"
 GL_LIBRARY_DIR="$CONDA_PREFIX/lib"
 
@@ -132,6 +144,10 @@ if [[ -z "$NVCC_PATH" || ! -x "$NVCC_PATH" ]]; then
 fi
 if [[ ! -f "$CUDA_INCLUDE_DIR/cuda_runtime.h" || ! -d "$CUDA_LIBRARY_DIR" ]]; then
     echo "[FreezeV2-Re] CUDA toolkit layout is incomplete under $CUDA_TARGET_ROOT" >&2
+    exit 2
+fi
+if [[ ! -f "$CUDA_LIBRARY_DIR/libculibos.a" ]]; then
+    echo "[FreezeV2-Re] CUDA cuLIBOS is missing at $CUDA_LIBRARY_DIR/libculibos.a" >&2
     exit 2
 fi
 if [[ ! -f "$GL_INCLUDE_DIR/EGL/egl.h" || \
@@ -153,6 +169,7 @@ export CUDAHOSTCXX="$HOST_CXX"
 echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
 echo "[FreezeV2-Re] CUDA headers: $CUDA_INCLUDE_DIR"
 echo "[FreezeV2-Re] CUDA libraries: $CUDA_LIBRARY_DIR"
+echo "[FreezeV2-Re] CUDA cuLIBOS: $CUDA_LIBRARY_DIR/libculibos.a"
 echo "[FreezeV2-Re] GLVND headers: $GL_INCLUDE_DIR"
 echo "[FreezeV2-Re] GLVND libraries: $GL_LIBRARY_DIR"
 echo "[FreezeV2-Re] nvcc: $("$NVCC_PATH" --version | tail -n 1)"
