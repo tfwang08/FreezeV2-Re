@@ -5,9 +5,11 @@ import numpy as np
 import freezev2.gedi_bridge as gedi_bridge
 from freezev2.gedi_bridge import (
     GEDI_REPO_COMMIT,
+    _load_official_gedi_class,
     build_gedi_config,
     concatenate_gedi_scales,
 )
+from freezev2.gedi_radius import radius_search
 
 
 def test_gedi_config_uses_freeze_scales_and_official_inference_shape():
@@ -35,6 +37,18 @@ def test_gedi_scale_concatenation_is_64d_and_ordered_30_then_40():
 
 def test_official_gedi_revision_is_pinned():
     assert GEDI_REPO_COMMIT == "b3dd86776750d8221f89d39975118da9839b39f7"
+
+
+def test_official_gedi_loader_injects_radius_search_shim(tmp_path):
+    (tmp_path / "gedi.py").write_text(
+        "import open3d.ml.torch as ml3d\n"
+        "class GeDi:\n"
+        "    radius_search = staticmethod(ml3d.ops.radius_search)\n"
+    )
+
+    cls = _load_official_gedi_class(tmp_path)
+
+    assert cls.radius_search is radius_search
 
 
 class _FakeTensor:
