@@ -216,9 +216,14 @@ def main() -> None:
     coarse.add_argument("--iterations", type=int, default=10_000)
     coarse.add_argument("--seed", type=int, default=0)
     coarse.add_argument(
-        "--edge-tolerance",
+        "--edge-similarity-threshold",
         type=float,
-        help="Triplet edge-length tolerance in 3D units; defaults to 0.03*diameter",
+        default=0.9,
+        help=(
+            "Relative triplet edge-length similarity in (0,1]; "
+            "0.9 is an Open3D-style reverse-engineering default, not a "
+            "paper-published constant"
+        ),
     )
     coarse.add_argument("--gt-id", type=int)
     coarse.add_argument("--output", type=Path)
@@ -242,8 +247,8 @@ def main() -> None:
             raise ValueError("--top-k must be positive")
         if args.iterations <= 0:
             raise ValueError("--iterations must be positive")
-        if args.edge_tolerance is not None and args.edge_tolerance <= 0:
-            raise ValueError("--edge-tolerance must be positive")
+        if not (0.0 < args.edge_similarity_threshold <= 1.0):
+            raise ValueError("--edge-similarity-threshold must be in (0, 1]")
         if args.gt_id is not None and args.gt_id < 0:
             raise ValueError("--gt-id must be non-negative")
 
@@ -308,11 +313,6 @@ def main() -> None:
                 raise ValueError(f"{name} contains non-finite values")
 
         inlier_threshold = 0.03 * diameter
-        edge_tolerance = (
-            inlier_threshold
-            if args.edge_tolerance is None
-            else float(args.edge_tolerance)
-        )
         candidate_idx, candidate_sim = topk_cosine_matches(
             target_features,
             query_features,
@@ -327,7 +327,7 @@ def main() -> None:
             k=args.top_k,
             iterations=args.iterations,
             seed=args.seed,
-            edge_tolerance=edge_tolerance,
+            edge_similarity_threshold=args.edge_similarity_threshold,
             return_debug=True,
         )
         coarse_pose = np.asarray(coarse_pose, dtype=np.float64)
@@ -393,7 +393,9 @@ def main() -> None:
             "candidate_similarities": np.asarray(candidate_sim, dtype=np.float64),
             "diameter": np.float32(diameter),
             "inlier_threshold": np.float32(inlier_threshold),
-            "edge_tolerance": np.float32(ransac_debug["edge_tolerance"]),
+            "edge_similarity_threshold": np.float32(
+                ransac_debug["edge_similarity_threshold"]
+            ),
             "top_k": np.int32(args.top_k),
             "iterations": np.int32(args.iterations),
             "seed": np.int32(args.seed),
@@ -441,7 +443,9 @@ def main() -> None:
             "top_k": args.top_k,
             "iterations": args.iterations,
             "inlier_threshold": float(inlier_threshold),
-            "edge_tolerance": float(ransac_debug["edge_tolerance"]),
+            "edge_similarity_threshold": float(
+                ransac_debug["edge_similarity_threshold"]
+            ),
             "top1_similarity_range": [float(top1.min()), float(top1.max())],
             "top1_similarity_mean": float(top1.mean()),
             "kth_similarity_mean": float(kth.mean()),
