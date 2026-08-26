@@ -1,5 +1,5 @@
 name: BOP reference check
-# Query visual pixel-lifting regression is covered by this workflow.
+# FreeZeV2 query visual regression is covered by this workflow.
 
 on:
   push:
