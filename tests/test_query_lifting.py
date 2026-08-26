@@ -3,8 +3,33 @@ import numpy as np
 from freezev2.onboard import CameraPose
 from freezev2.query_features import (
     finalize_pixel_lifted_visual_aggregation,
+    query_object_crop_bbox,
     rendered_pixels_to_model_points,
+    renderer_pixels_to_query_crop_xy,
 )
+
+
+def test_query_object_crop_uses_tight_mask_bbox_and_224_coordinates():
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[2:6, 3:9] = True
+
+    bbox = query_object_crop_bbox(mask)
+    np.testing.assert_array_equal(bbox, [3, 2, 9, 6])
+
+    pixels = np.array([[3, 2], [8, 5], [5, 3]], dtype=np.int64)
+    crop_xy = renderer_pixels_to_query_crop_xy(
+        pixels,
+        bbox,
+        output_size=224,
+    )
+    expected = np.array(
+        [
+            [0.5 * 224.0 / 6.0, 0.5 * 224.0 / 4.0],
+            [5.5 * 224.0 / 6.0, 3.5 * 224.0 / 4.0],
+            [2.5 * 224.0 / 6.0, 1.5 * 224.0 / 4.0],
+        ]
+    )
+    np.testing.assert_allclose(crop_xy, expected, atol=1e-12)
 
 
 def test_rendered_pixels_backproject_from_half_integer_image_centers():
