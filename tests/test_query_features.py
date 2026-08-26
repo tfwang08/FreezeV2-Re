@@ -50,7 +50,7 @@ def test_streaming_query_features_sample_continuous_projection_coordinates():
     assert counts.tolist() == [1]
 
 
-def test_pixel_lifted_query_features_aggregate_per_view_and_pixel_support():
+def test_pixel_lifted_query_features_crop_each_view_to_224_before_dino():
     camera = CameraPose(
         R=np.eye(3),
         t=np.zeros(3),
@@ -81,17 +81,20 @@ def test_pixel_lifted_query_features_aggregate_per_view_and_pixel_support():
     ]
     query_points = np.array([[0.5, 0.5, 1.0]], dtype=np.float64)
     feature_maps = [
-        torch.tensor([[[1.0, 3.0], [5.0, 7.0]]]),
-        torch.tensor([[[9.0, 11.0], [13.0, 15.0]]]),
+        torch.full((1, 16, 16), 3.0),
+        torch.full((1, 16, 16), 9.0),
     ]
 
     class FakeExtractor:
-        last_image_hw = (2, 2)
+        last_image_hw = None
 
         def __init__(self):
             self.index = 0
 
         def encode(self, image):
+            image = np.asarray(image)
+            assert image.shape == (224, 224, 3)
+            self.last_image_hw = (224, 224)
             output = feature_maps[self.index]
             self.index += 1
             return output
@@ -111,9 +114,9 @@ def test_pixel_lifted_query_features_aggregate_per_view_and_pixel_support():
     )
 
     np.testing.assert_allclose(points, query_points)
-    # View A mean = (1 + 3 + 5) / 3 = 3; view B mean = 9.
+    # View A contributes mean feature 3; view B contributes mean feature 9.
     np.testing.assert_allclose(view_uniform, [[6.0]], atol=1e-6)
-    # Pixel-support weighting equals the mean over all four supporting pixels.
+    # Three pixels from A and one from B -> (3*3 + 9) / 4 = 4.5.
     np.testing.assert_allclose(pixel_support, [[4.5]], atol=1e-6)
     np.testing.assert_array_equal(view_counts, [2])
     np.testing.assert_array_equal(pixel_counts, [4])
