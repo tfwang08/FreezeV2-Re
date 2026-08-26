@@ -22,7 +22,9 @@ from freezev2.features import (
 from freezev2.fusion import VisualPCA, fit_visual_pca, fuse_visual_geometric
 from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
 from freezev2.geometry import backproject_depth
+from freezev2.matching import topk_cosine_matches
 from freezev2.onboard import load_onboarding_templates
+from freezev2.pipeline import estimate_pose_from_features
 from freezev2.query_features import aggregate_query_visual_features_streaming
 
 
@@ -84,6 +86,14 @@ def _sample_mask_patch_centers(
     if len(ids):
         keep[ids] = mask[pixels[ids, 1], pixels[ids, 0]]
     return centers[keep].astype(np.float32), pixels[keep]
+
+
+def _rotation_error_deg(predicted: np.ndarray, reference: np.ndarray) -> float:
+    predicted = np.asarray(predicted, dtype=np.float64).reshape(3, 3)
+    reference = np.asarray(reference, dtype=np.float64).reshape(3, 3)
+    delta = predicted @ reference.T
+    cosine = float(np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
 
 
 def main() -> None:
@@ -192,6 +202,24 @@ def main() -> None:
     target_viz.add_argument("--output", type=Path)
     target_viz.add_argument("--radius", type=int, default=3)
 
+    coarse = subparsers.add_parser(
+        "estimate-coarse-pose",
+        help="Match saved query/target descriptors and run feature-aware 3D-3D RANSAC",
+    )
+    coarse.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    coarse.add_argument("--scene-id", type=int, required=True)
+    coarse.add_argument("--im-id", type=int, required=True)
+    coarse.add_argument("--obj-id", type=int, required=True)
+    coarse.add_argument("--query-cache", type=Path)
+    coarse.add_argument("--target-cache", type=Path, required=True)
+    coarse.add_argument("--bop-root", type=Path, default=Path("data/bop"))
+    coarse.add_argument("--split", default="test")
+    coarse.add_argument("--top-k", type=int, default=10)
+    coarse.add_argument("--iterations", type=int, default=10_000)
+    coarse.add_argument("--seed", type=int, default=0)
+    coarse.add_argument("--gt-id", type=int)
+    coarse.add_argument("--output", type=Path)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -200,6 +228,207 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "estimate-coarse-pose":
+        if args.scene_id < 0 or args.im_id < 0:
+            raise ValueError("--scene-id and --im-id must be non-negative")
+        if args.obj_id <= 0:
+            raise ValueError("--obj-id must be positive")
+        if args.top_k <= 0:
+            raise ValueError("--top-k must be positive")
+        if args.iterations <= 0:
+            raise ValueError("--iterations must be positive")
+        if args.gt_id is not None and args.gt_id < 0:
+            raise ValueError("--gt-id must be non-negative")
+
+        query_cache = args.query_cache or (
+            Path("outputs/features")
+            / f"{args.dataset}_obj_{args.obj_id:06d}_query.npz"
+        )
+        if not query_cache.is_file():
+            raise FileNotFoundError(f"query cache not found: {query_cache}")
+        if not args.target_cache.is_file():
+            raise FileNotFoundError(f"target cache not found: {args.target_cache}")
+
+        with np.load(query_cache, allow_pickle=False) as data:
+            required = ("query_points", "fused_features", "diameter")
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise KeyError("query cache is missing: " + ", ".join(missing))
+            query_points = np.asarray(data["query_points"], dtype=np.float32)
+            query_features = np.asarray(data["fused_features"], dtype=np.float32)
+            diameter = float(data["diameter"])
+
+        with np.load(args.target_cache, allow_pickle=False) as data:
+            required = ("sparse_points", "target_features")
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise KeyError("target cache is missing: " + ", ".join(missing))
+            target_points = np.asarray(data["sparse_points"], dtype=np.float32)
+            target_features = np.asarray(data["target_features"], dtype=np.float32)
+            for key, expected in (
+                ("scene_id", args.scene_id),
+                ("im_id", args.im_id),
+                ("obj_id", args.obj_id),
+            ):
+                if key in data and int(data[key]) != int(expected):
+                    raise ValueError(
+                        f"target cache {key}={int(data[key])} does not match CLI {expected}"
+                    )
+
+        if query_points.ndim != 2 or query_points.shape[1] != 3:
+            raise ValueError("query_points must have shape Nx3")
+        if target_points.ndim != 2 or target_points.shape[1] != 3:
+            raise ValueError("target sparse_points must have shape Nx3")
+        if len(target_points) < 3:
+            raise ValueError("coarse pose estimation requires at least 3 target points")
+        if query_features.ndim != 2 or len(query_features) != len(query_points):
+            raise ValueError("query fused_features must have shape NxD matching query_points")
+        if target_features.ndim != 2 or len(target_features) != len(target_points):
+            raise ValueError("target_features must have shape NxD matching sparse_points")
+        if query_features.shape[1] != target_features.shape[1]:
+            raise ValueError("query and target descriptor dimensions do not match")
+        if args.top_k > len(query_points):
+            raise ValueError("--top-k cannot exceed the number of query points")
+        if diameter <= 0 or not np.isfinite(diameter):
+            raise ValueError("query object diameter must be positive and finite")
+        for name, array in (
+            ("query_points", query_points),
+            ("query_features", query_features),
+            ("target_points", target_points),
+            ("target_features", target_features),
+        ):
+            if not np.isfinite(array).all():
+                raise ValueError(f"{name} contains non-finite values")
+
+        candidate_idx, candidate_sim = topk_cosine_matches(
+            target_features,
+            query_features,
+            k=args.top_k,
+        )
+        coarse_pose, coarse_score = estimate_pose_from_features(
+            query_points,
+            query_features,
+            target_points,
+            target_features,
+            diameter,
+            k=args.top_k,
+            iterations=args.iterations,
+            seed=args.seed,
+        )
+        coarse_pose = np.asarray(coarse_pose, dtype=np.float64)
+        if coarse_pose.shape != (4, 4) or not np.isfinite(coarse_pose).all():
+            raise RuntimeError("coarse pose must be a finite 4x4 matrix")
+
+        inlier_threshold = 0.03 * diameter
+        R_pred = coarse_pose[:3, :3]
+        t_pred = coarse_pose[:3, 3]
+        rotation_det = float(np.linalg.det(R_pred))
+        rotation_orthogonality_error = float(
+            np.linalg.norm(R_pred.T @ R_pred - np.eye(3), ord="fro")
+        )
+
+        gt_R = None
+        gt_t = None
+        rotation_error_deg = None
+        translation_error_mm = None
+        gt_path = None
+        if args.gt_id is not None:
+            gt_path = (
+                args.bop_root
+                / args.dataset
+                / args.split
+                / f"{args.scene_id:06d}"
+                / "scene_gt.json"
+            )
+            if not gt_path.is_file():
+                raise FileNotFoundError(f"scene GT not found: {gt_path}")
+            scene_gt = json.loads(gt_path.read_text())
+            annotations = scene_gt.get(str(args.im_id))
+            if annotations is None:
+                annotations = scene_gt.get(f"{args.im_id:06d}")
+            if annotations is None:
+                raise KeyError(f"image {args.im_id} missing from {gt_path}")
+            if args.gt_id >= len(annotations):
+                raise IndexError(
+                    f"gt_id {args.gt_id} out of range for image {args.im_id}"
+                )
+            annotation = annotations[args.gt_id]
+            if int(annotation["obj_id"]) != args.obj_id:
+                raise ValueError(
+                    f"GT entry obj_id={annotation['obj_id']} does not match --obj-id {args.obj_id}"
+                )
+            gt_R = np.asarray(annotation["cam_R_m2c"], dtype=np.float64).reshape(3, 3)
+            gt_t = np.asarray(annotation["cam_t_m2c"], dtype=np.float64).reshape(3)
+            rotation_error_deg = _rotation_error_deg(R_pred, gt_R)
+            translation_error_mm = float(np.linalg.norm(t_pred - gt_t))
+
+        output = args.output or (
+            Path("outputs/poses")
+            / (
+                f"{args.dataset}_scene_{args.scene_id:06d}_im_{args.im_id:06d}_"
+                f"obj_{args.obj_id:06d}_coarse.npz"
+            )
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "coarse_pose": coarse_pose,
+            "coarse_score": np.float64(coarse_score),
+            "candidate_query_indices": np.asarray(candidate_idx, dtype=np.int64),
+            "candidate_similarities": np.asarray(candidate_sim, dtype=np.float64),
+            "diameter": np.float32(diameter),
+            "inlier_threshold": np.float32(inlier_threshold),
+            "top_k": np.int32(args.top_k),
+            "iterations": np.int32(args.iterations),
+            "seed": np.int32(args.seed),
+            "scene_id": np.int32(args.scene_id),
+            "im_id": np.int32(args.im_id),
+            "obj_id": np.int32(args.obj_id),
+            "query_source": np.array(str(query_cache)),
+            "target_source": np.array(str(args.target_cache)),
+        }
+        if args.gt_id is not None:
+            payload.update({
+                "gt_id": np.int32(args.gt_id),
+                "gt_R": gt_R,
+                "gt_t": gt_t,
+                "rotation_error_deg": np.float64(rotation_error_deg),
+                "translation_error_mm": np.float64(translation_error_mm),
+                "scene_gt_source": np.array(str(gt_path)),
+            })
+        np.savez_compressed(output, **payload)
+
+        top1 = np.asarray(candidate_sim[:, 0], dtype=np.float64)
+        kth = np.asarray(candidate_sim[:, -1], dtype=np.float64)
+        report = {
+            "dataset": args.dataset,
+            "scene_id": args.scene_id,
+            "im_id": args.im_id,
+            "obj_id": args.obj_id,
+            "query_points": list(query_points.shape),
+            "target_points": list(target_points.shape),
+            "descriptor_dim": int(query_features.shape[1]),
+            "top_k": args.top_k,
+            "iterations": args.iterations,
+            "inlier_threshold": float(inlier_threshold),
+            "top1_similarity_range": [float(top1.min()), float(top1.max())],
+            "top1_similarity_mean": float(top1.mean()),
+            "kth_similarity_mean": float(kth.mean()),
+            "coarse_score": float(coarse_score),
+            "rotation_determinant": rotation_det,
+            "rotation_orthogonality_error": rotation_orthogonality_error,
+            "R": R_pred.tolist(),
+            "t_mm": t_pred.tolist(),
+            "output": str(output),
+        }
+        if args.gt_id is not None:
+            report.update({
+                "gt_id": args.gt_id,
+                "rotation_error_deg": float(rotation_error_deg),
+                "translation_error_mm": float(translation_error_mm),
+            })
+        print(json.dumps(report, indent=2, sort_keys=True))
         return
 
     if args.command == "visualize-target":
