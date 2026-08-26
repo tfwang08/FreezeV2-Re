@@ -75,18 +75,27 @@ def test_feature_aware_score_sums_all_inlier_correspondences():
     np.testing.assert_allclose(score, 1.5)
 
 
-def test_triplet_edge_pruning_rejects_incompatible_correspondences():
+def test_triplet_edge_pruning_uses_relative_edge_length_ratio():
     src = np.array([
         [0.0, 0.0, 0.0],
         [10.0, 0.0, 0.0],
         [0.0, 10.0, 0.0],
     ])
-    compatible = src + np.array([30.0, -20.0, 100.0])
-    incompatible = compatible.copy()
-    incompatible[1, 0] += 4.0
+    compatible = np.array([
+        [30.0, -20.0, 100.0],
+        [40.5, -20.0, 100.0],
+        [30.0, -30.0, 100.0],
+    ])
+    incompatible = np.array([
+        [30.0, -20.0, 100.0],
+        [42.0, -20.0, 100.0],
+        [30.0, -30.0, 100.0],
+    ])
 
-    assert _triplet_edges_compatible(src, compatible, tolerance=1.0)
-    assert not _triplet_edges_compatible(src, incompatible, tolerance=1.0)
+    # Open3D-style relative checker: every corresponding edge must satisfy
+    # src > ratio * dst and dst > ratio * src. 10/10.5 passes 0.9; 10/12 fails.
+    assert _triplet_edges_compatible(src, compatible, similarity_threshold=0.9)
+    assert not _triplet_edges_compatible(src, incompatible, similarity_threshold=0.9)
 
 
 def test_feature_aware_ransac_returns_winning_diagnostics():
@@ -109,7 +118,7 @@ def test_feature_aware_ransac_returns_winning_diagnostics():
         target_features=target_features,
         candidate_query_indices=candidate_query_indices,
         inlier_threshold=0.5,
-        edge_tolerance=0.5,
+        edge_similarity_threshold=0.9,
         iterations=50,
         seed=3,
         return_debug=True,
@@ -123,7 +132,7 @@ def test_feature_aware_ransac_returns_winning_diagnostics():
     assert debug["winning_target_indices"].shape == (3,)
     assert debug["winning_candidate_columns"].shape == (3,)
     assert debug["winning_query_indices"].shape == (3,)
-    np.testing.assert_allclose(debug["edge_tolerance"], 0.5)
+    np.testing.assert_allclose(debug["edge_similarity_threshold"], 0.9)
 
 
 def test_feature_aware_pipeline_recovers_pose():
