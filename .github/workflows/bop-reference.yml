@@ -1,4 +1,5 @@
 name: BOP reference check
+# Query visual pixel-lifting regression is covered by this workflow.
 
 on:
   push:
