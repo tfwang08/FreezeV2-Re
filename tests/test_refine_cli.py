@@ -110,8 +110,12 @@ def test_refine_pose_saves_icp_and_final_scores(tmp_path, monkeypatch, capsys):
         np.testing.assert_allclose(float(data["final_score"]), 0.8, atol=1e-7)
         assert int(data["icp_max_iterations"]) == 30
         np.testing.assert_allclose([data["alpha"], data["beta"], data["gamma"]], [1.0, 1.0, 1.0])
-        np.testing.assert_allclose(float(data["fine_rotation_error_deg"]), 0.0, atol=1e-7)
-        np.testing.assert_allclose(float(data["fine_translation_error_mm"]), 0.0, atol=1e-7)
+        # The real target cache is float32, so an otherwise exact synthetic
+        # rigid transform retains only float32 point precision.  GT metrics in
+        # the low-microdegree/sub-micron range are already numerical zero for
+        # this interface and should not be tested against float64 exactness.
+        np.testing.assert_allclose(float(data["fine_rotation_error_deg"]), 0.0, atol=1e-5)
+        np.testing.assert_allclose(float(data["fine_translation_error_mm"]), 0.0, atol=1e-5)
 
     report = json.loads(capsys.readouterr().out)
     np.testing.assert_allclose(report["icp_threshold"], 3.0)
@@ -119,5 +123,5 @@ def test_refine_pose_saves_icp_and_final_scores(tmp_path, monkeypatch, capsys):
     np.testing.assert_allclose(report["fine_feature_score"], 1.0, atol=1e-7)
     np.testing.assert_allclose(report["icp_score"], 1.0, atol=1e-7)
     np.testing.assert_allclose(report["final_score"], 0.8, atol=1e-7)
-    np.testing.assert_allclose(report["fine_rotation_error_deg"], 0.0, atol=1e-7)
-    np.testing.assert_allclose(report["fine_translation_error_mm"], 0.0, atol=1e-7)
+    np.testing.assert_allclose(report["fine_rotation_error_deg"], 0.0, atol=1e-5)
+    np.testing.assert_allclose(report["fine_translation_error_mm"], 0.0, atol=1e-5)
