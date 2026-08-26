@@ -38,24 +38,24 @@ def _normalize(x: np.ndarray) -> np.ndarray:
 def _triplet_edges_compatible(
     source: np.ndarray,
     target: np.ndarray,
-    tolerance: float,
+    similarity_threshold: float,
 ) -> bool:
-    """Reject a 3D-3D correspondence triplet with inconsistent edge lengths.
+    """Check rigid-triplet consistency using relative pairwise edge lengths.
 
-    A rigid transform preserves the three pairwise distances of a triplet. The
-    FreeZeV2 paper describes a fast relative edge-length pruning step but does
-    not publish a separate numeric pruning constant. The caller therefore
-    supplies an explicit absolute tolerance in the same 3D units as the point
-    clouds; the pipeline defaults it to the published 0.03*diameter inlier
-    threshold so no hidden constant is introduced.
+    ``similarity_threshold`` is dimensionless and follows the conventional
+    Open3D-style edge-length checker: for every corresponding edge, each edge
+    length must exceed ``threshold`` times the other.  A value near one is
+    stricter.  FreeZeV2 describes relative edge-length pruning but does not
+    publish this numeric threshold, so callers must keep it explicit.
     """
     source = np.asarray(source, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
-    tolerance = float(tolerance)
+    threshold = float(similarity_threshold)
     if source.shape != (3, 3) or target.shape != (3, 3):
         raise ValueError("source and target triplets must each have shape 3x3")
-    if tolerance <= 0 or not np.isfinite(tolerance):
-        raise ValueError("tolerance must be positive and finite")
+    if not np.isfinite(threshold) or not (0.0 < threshold <= 1.0):
+        raise ValueError("similarity_threshold must be finite and in (0, 1]")
+
     pairs = ((0, 1), (0, 2), (1, 2))
     source_edges = np.asarray([
         np.linalg.norm(source[a] - source[b]) for a, b in pairs
@@ -63,7 +63,17 @@ def _triplet_edges_compatible(
     target_edges = np.asarray([
         np.linalg.norm(target[a] - target[b]) for a, b in pairs
     ])
-    return bool(np.all(np.abs(source_edges - target_edges) <= tolerance))
+    if (
+        not np.isfinite(source_edges).all()
+        or not np.isfinite(target_edges).all()
+        or np.any(source_edges <= 0.0)
+        or np.any(target_edges <= 0.0)
+    ):
+        return False
+    return bool(np.all(
+        (source_edges > threshold * target_edges)
+        & (target_edges > threshold * source_edges)
+    ))
 
 
 def _inlier_mask(
@@ -106,15 +116,16 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
                          target_points: np.ndarray, target_features: np.ndarray,
                          candidate_query_indices: np.ndarray, inlier_threshold: float,
                          iterations: int = 10_000, seed: int = 0,
-                         edge_tolerance: float | None = None,
+                         edge_similarity_threshold: float = 0.9,
                          return_debug: bool = False):
     """FreeZeV2-style feature-aware 3D-3D RANSAC.
 
-    By default the published inlier threshold is also used for triplet
-    edge-length pruning because the paper does not report a separate numeric
-    pruning constant. Set ``edge_tolerance`` explicitly to study that
-    reverse-engineering choice. ``return_debug=True`` appends a dictionary with
-    the winning sampled correspondences and inlier statistics.
+    The published geometric inlier threshold stays independent of triplet
+    pruning. ``edge_similarity_threshold`` is an explicit reverse-engineering
+    parameter for the paper's unpublished relative-edge consistency check;
+    0.9 is an Open3D-style candidate rather than a paper-published constant.
+    ``return_debug=True`` appends the winning sampled correspondences and
+    pruning/inlier statistics.
     """
     qp = np.asarray(query_points, dtype=np.float64)
     tp = np.asarray(target_points, dtype=np.float64)
@@ -131,11 +142,12 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
         raise ValueError("iterations must be positive")
     if float(inlier_threshold) <= 0:
         raise ValueError("inlier_threshold must be positive")
-    if edge_tolerance is None:
-        edge_tolerance = float(inlier_threshold)
-    edge_tolerance = float(edge_tolerance)
-    if edge_tolerance <= 0 or not np.isfinite(edge_tolerance):
-        raise ValueError("edge_tolerance must be positive and finite")
+    edge_similarity_threshold = float(edge_similarity_threshold)
+    if (
+        not np.isfinite(edge_similarity_threshold)
+        or not (0.0 < edge_similarity_threshold <= 1.0)
+    ):
+        raise ValueError("edge_similarity_threshold must be finite and in (0, 1]")
 
     rng = np.random.default_rng(seed)
     best_pose = np.eye(4, dtype=np.float64)
@@ -163,7 +175,11 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
         ):
             degenerate_triplets += 1
             continue
-        if not _triplet_edges_compatible(src, dst, edge_tolerance):
+        if not _triplet_edges_compatible(
+            src,
+            dst,
+            similarity_threshold=edge_similarity_threshold,
+        ):
             edge_pruned_triplets += 1
             continue
         try:
@@ -206,7 +222,7 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
         "winning_query_indices": best_query_indices,
         "inlier_count": inlier_count,
         "inlier_target_count": inlier_target_count,
-        "edge_tolerance": edge_tolerance,
+        "edge_similarity_threshold": edge_similarity_threshold,
         "degenerate_triplets": int(degenerate_triplets),
         "edge_pruned_triplets": int(edge_pruned_triplets),
         "valid_hypotheses": int(valid_hypotheses),
