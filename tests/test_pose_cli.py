@@ -102,6 +102,9 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
             "inlier_count": 7,
             "inlier_target_count": 4,
             "edge_tolerance": 3.0,
+            "degenerate_triplets": 11,
+            "edge_pruned_triplets": 23,
+            "valid_hypotheses": 9966,
         }
         return pose, 2.75, debug
 
@@ -150,6 +153,9 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
         assert int(data["gt_id"]) == 0
         assert int(data["inlier_count"]) == 7
         assert int(data["inlier_target_count"]) == 4
+        assert int(data["degenerate_triplets"]) == 11
+        assert int(data["edge_pruned_triplets"]) == 23
+        assert int(data["valid_hypotheses"]) == 9966
         np.testing.assert_array_equal(data["winning_target_indices"], [0, 1, 2])
         np.testing.assert_array_equal(data["winning_candidate_columns"], [0, 1, 2])
         np.testing.assert_array_equal(data["winning_query_indices"], [0, 1, 2])
@@ -161,6 +167,9 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
     assert report["iterations"] == 10_000
     assert report["inlier_count"] == 7
     assert report["inlier_target_count"] == 4
+    assert report["degenerate_triplets"] == 11
+    assert report["edge_pruned_triplets"] == 23
+    assert report["valid_hypotheses"] == 9966
     np.testing.assert_allclose(report["inlier_threshold"], 3.0)
     np.testing.assert_allclose(report["edge_tolerance"], 3.0)
     np.testing.assert_allclose(report["rotation_error_deg"], 0.0, atol=1e-10)
