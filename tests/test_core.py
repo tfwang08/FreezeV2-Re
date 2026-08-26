@@ -2,7 +2,7 @@ import csv
 import numpy as np
 from freezev2.geometry import backproject_depth, kabsch
 from freezev2.matching import topk_cosine_matches
-from freezev2.pose import feature_aware_ransac, sparse_grid_pixels
+from freezev2.pose import _score_hypothesis, feature_aware_ransac, sparse_grid_pixels
 from freezev2.pipeline import estimate_pose_from_features
 from freezev2.bop import write_bop_csv
 
@@ -41,6 +41,33 @@ def test_sparse_grid_stays_inside_mask():
     uv = sparse_grid_pixels(mask, 16)
     assert 100 < len(uv) <= 256
     assert np.all(mask[uv[:,1], uv[:,0]])
+
+
+def test_feature_aware_score_sums_all_inlier_correspondences():
+    pose = np.eye(4, dtype=np.float64)
+    query_points = np.zeros((2, 3), dtype=np.float64)
+    target_points = np.zeros((1, 3), dtype=np.float64)
+    query_features = np.array([
+        [1.0, 0.0],
+        [0.5, np.sqrt(0.75)],
+    ])
+    target_features = np.array([[1.0, 0.0]])
+    candidate_query_indices = np.array([[0, 1]], dtype=np.int64)
+
+    score = _score_hypothesis(
+        pose,
+        query_points,
+        query_features,
+        target_points,
+        target_features,
+        candidate_query_indices,
+        inlier_threshold=1.0,
+    )
+
+    # FreeZeV2 Eq. (5): sum the cosine of every inlier correspondence,
+    # then divide by the number of sparse target points. Both correspondences
+    # are exact geometric inliers here, with cosine 1.0 and 0.5.
+    np.testing.assert_allclose(score, 1.5)
 
 
 def test_feature_aware_pipeline_recovers_pose():
