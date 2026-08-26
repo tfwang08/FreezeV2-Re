@@ -149,8 +149,15 @@ def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, mo
     calls = {}
 
     class FakeDinoExtractor:
-        def __init__(self, device, layer, facet="token", repo_or_dir=None):
-            calls["dino"] = (device, layer, facet, Path(repo_or_dir))
+        def __init__(
+            self,
+            device,
+            layer,
+            facet="token",
+            model_name="dinov2_vitg14",
+            repo_or_dir=None,
+        ):
+            calls["dino"] = (device, layer, facet, model_name, Path(repo_or_dir))
 
     def fake_load_templates(cache_path, images):
         calls["templates"] = (Path(cache_path), Path(images))
@@ -207,6 +214,8 @@ def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, mo
         "30",
         "--depth-tolerance",
         "1.0",
+        "--dino-model",
+        "dinov2_vitg14_reg",
         "--onboarding-cache",
         str(onboarding),
         "--rgb-dir",
@@ -219,7 +228,13 @@ def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, mo
 
     run_bop.main()
 
-    assert calls["dino"] == ("cuda", 30, "token", dinov2_root)
+    assert calls["dino"] == (
+        "cuda",
+        30,
+        "token",
+        "dinov2_vitg14_reg",
+        dinov2_root,
+    )
     assert calls["templates"] == (onboarding, rgb_dir)
     assert calls["aggregate"] == (1.0, 18, "inverse_bilinear")
     with np.load(output, allow_pickle=False) as data:
@@ -233,6 +248,7 @@ def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, mo
         assert str(np.asarray(data["query_visibility"]).item()) == "rendered_depth"
         assert int(data["dino_layer"]) == 30
         assert str(data["dino_facet"]) == "token"
+        assert str(np.asarray(data["dino_model"]).item()) == "dinov2_vitg14_reg"
         assert float(data["depth_tolerance"]) == 1.0
         assert str(np.asarray(data["depth_sampling"]).item()) == "inverse_bilinear"
         assert int(data["min_views"]) == 18
