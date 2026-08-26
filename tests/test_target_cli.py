@@ -28,6 +28,27 @@ class _FakeSampled:
         return self.array
 
 
+def test_mask_patch_centers_use_smallest_square_bbox():
+    assert hasattr(run_bop, "_sample_mask_patch_centers")
+
+    mask = np.zeros((80, 100), dtype=bool)
+    mask[30:50, 20:62] = True  # 42 px wide, 20 px tall.
+    centers, pixels = run_bop._sample_mask_patch_centers(mask, grid_size=4)
+
+    # The 42x20 rectangle is expanded about its center to a 42x42 square.
+    # Four grid rows are centered at y={24.25,34.75,45.25,55.75}; only the
+    # middle two rows have centers inside the original mask.
+    assert centers.shape == (8, 2)
+    assert pixels.shape == (8, 2)
+    np.testing.assert_allclose(
+        np.unique(centers[:, 0]),
+        [25.25, 35.75, 46.25, 56.75],
+    )
+    np.testing.assert_allclose(np.unique(centers[:, 1]), [34.75, 45.25])
+    np.testing.assert_array_equal(pixels, np.floor(centers).astype(np.int64))
+    assert np.all(mask[pixels[:, 1], pixels[:, 0]])
+
+
 def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, monkeypatch):
     bop_root = tmp_path / "data" / "bop"
     scene_dir = bop_root / "lmo" / "test" / "000002"
@@ -80,11 +101,11 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
 
         def compatible_image_hw(self, image_hw):
             assert tuple(image_hw) == (64, 64)
-            return (56, 56)
+            return (64, 64)
 
         def encode(self, image):
             calls["rgb_shape"] = tuple(np.asarray(image).shape)
-            self.last_image_hw = (56, 56)
+            self.last_image_hw = (64, 64)
             return object()
 
     class FakeGediExtractor:
@@ -145,27 +166,35 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         dinov2_root,
     )
     assert calls["rgb_shape"] == (64, 64, 3)
-    assert calls["sample_hw"] == (56, 56)
+    assert calls["sample_hw"] == (64, 64)
     assert calls["gedi_shapes"] == ((256, 3), (3000, 3), 100.0)
+
     sampled = calls["sample_pixels"]
     assert sampled.shape == (256, 2)
-    np.testing.assert_allclose(sampled % 1.0, 0.5)
-    assert np.all(sampled[:, 0] < 56.0)
-    assert np.all(sampled[:, 1] < 56.0)
+    expected_axis = np.arange(2.0, 64.0, 4.0, dtype=np.float32)
+    np.testing.assert_allclose(np.unique(sampled[:, 0]), expected_axis)
+    np.testing.assert_allclose(np.unique(sampled[:, 1]), expected_axis)
 
     with np.load(output, allow_pickle=False) as data:
         sparse_pixels = np.asarray(data["sparse_pixels"])
+        sparse_image_xy = np.asarray(data["sparse_image_xy"])
         sparse_points = np.asarray(data["sparse_points"])
         dense_points = np.asarray(data["dense_points"])
         target = np.asarray(data["target_features"])
         assert sparse_pixels.shape == (256, 2)
+        assert sparse_image_xy.shape == (256, 2)
         assert sparse_points.shape == (256, 3)
         assert dense_points.shape == (3000, 3)
         assert data["visual_features"].shape == (256, 96)
         assert data["geometric_features"].shape == (256, 64)
         assert target.shape == (256, 128)
+        np.testing.assert_allclose(sparse_image_xy, sampled)
+        np.testing.assert_array_equal(sparse_pixels, np.floor(sampled).astype(np.int32))
         np.testing.assert_allclose(sparse_points[:, 2], 100.0)
         np.testing.assert_allclose(dense_points[:, 2], 100.0)
+        expected_cv = sparse_image_xy - 0.5
+        np.testing.assert_allclose(sparse_points[:, 0], expected_cv[:, 0] - 32.0)
+        np.testing.assert_allclose(sparse_points[:, 1], expected_cv[:, 1] - 32.0)
         np.testing.assert_allclose(np.linalg.norm(target[:, :64], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(np.linalg.norm(target[:, 64:], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(float(data["depth_scale"]), 0.1, atol=1e-7)
