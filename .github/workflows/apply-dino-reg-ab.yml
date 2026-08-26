@@ -1,0 +1,62 @@
+name: Apply DINO register A/B patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-dino-reg-ab.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch selectable query DINO backbone
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("run_bop.py")
+          text = path.read_text()
+
+          old = '''    visual.add_argument("--device", default="cuda")\n    visual.add_argument("--facet", default="token", choices=["token"])\n'''
+          new = '''    visual.add_argument("--device", default="cuda")\n    visual.add_argument(\n        "--dino-model",\n        default=DINOV2_MODEL_NAME,\n        choices=[DINOV2_MODEL_NAME, "dinov2_vitg14_reg"],\n        help=(\n            "DINOv2 giant backbone. The -reg variant is a FoundPose-faithful "\n            "A/B candidate; the paper does not explicitly publish whether "\n            "FreeZeV2 uses register tokens."\n        ),\n    )\n    visual.add_argument("--facet", default="token", choices=["token"])\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"parser anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        extractor = DinoExtractor(\n            device=args.device,\n            layer=args.layer,\n            facet=args.facet,\n            repo_or_dir=args.dinov2_root,\n        )\n'''
+          new = '''        extractor = DinoExtractor(\n            device=args.device,\n            layer=args.layer,\n            facet=args.facet,\n            model_name=args.dino_model,\n            repo_or_dir=args.dinov2_root,\n        )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"extractor anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''            dino_model=np.array(DINOV2_MODEL_NAME),\n'''
+          new = '''            dino_model=np.array(args.dino_model),\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"cache model anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''            "dino_model": DINOV2_MODEL_NAME,\n'''
+          new = '''            "dino_model": args.dino_model,\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"report model anchor count={text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add run_bop.py
+          git diff --cached --check
+          git commit -m "feat: add DINOv2 register-backbone A/B"
+          git push
