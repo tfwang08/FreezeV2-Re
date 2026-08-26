@@ -233,8 +233,11 @@ def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatc
         )
         np.testing.assert_array_equal(data["view_counts"], np.full(6, 21))
         np.testing.assert_array_equal(data["pixel_support_counts"], np.full(6, 321))
-        assert str(np.asarray(data["visual_aggregation"]).item()) == "pixel_lift_nn_view_uniform"
+        assert str(np.asarray(data["visual_aggregation"]).item()) == "tight_crop_224_pixel_lift_nn_view_uniform"
         assert str(np.asarray(data["visual_weighting_candidate"]).item()) == "pixel_support"
+        assert str(np.asarray(data["query_dino_mode"]).item()) == "tight_mask_crop_224_pixel_lift"
+        np.testing.assert_array_equal(data["query_dino_input_hw"], [224, 224])
+        np.testing.assert_array_equal(data["query_dino_patch_grid"], [16, 16])
         assert int(data["dino_layer"]) == 30
         assert str(data["dino_facet"]) == "token"
         assert float(data["legacy_depth_tolerance"]) == 1.0
