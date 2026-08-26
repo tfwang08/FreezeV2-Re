@@ -134,3 +134,90 @@ def test_fuse_query_features_saves_128d_and_query_pca(tmp_path, monkeypatch):
             atol=1e-5,
         )
         assert np.isfinite(fused).all()
+
+
+def test_extract_query_visual_saves_streamed_dino_cache(tmp_path, monkeypatch):
+    points = np.arange(18, dtype=np.float32).reshape(6, 3)
+    onboarding = tmp_path / "onboarding.npz"
+    np.savez_compressed(onboarding, query_points=points)
+    rgb_dir = tmp_path / "rgb"
+    rgb_dir.mkdir()
+    dinov2_root = tmp_path / "dinov2"
+    dinov2_root.mkdir()
+    output = tmp_path / "visual.npz"
+    templates = [object(), object()]
+    calls = {}
+
+    class FakeDinoExtractor:
+        def __init__(self, device, layer, facet="token", repo_or_dir=None):
+            calls["dino"] = (device, layer, facet, Path(repo_or_dir))
+
+    def fake_load_templates(cache_path, images):
+        calls["templates"] = (Path(cache_path), Path(images))
+        return templates
+
+    def fake_aggregate(
+        query_points,
+        loaded_templates,
+        extractor,
+        depth_tolerance,
+        min_views=18,
+        view_weights=None,
+        depth_sampling="inverse_bilinear",
+    ):
+        np.testing.assert_array_equal(query_points, points)
+        assert loaded_templates is templates
+        assert isinstance(extractor, FakeDinoExtractor)
+        calls["aggregate"] = (depth_tolerance, min_views, view_weights, depth_sampling)
+        visual = np.arange(len(points) * 12, dtype=np.float32).reshape(len(points), 12)
+        counts = np.full(len(points), 21, dtype=np.int32)
+        return points.copy(), visual, counts
+
+    monkeypatch.setattr(run_bop, "DinoExtractor", FakeDinoExtractor, raising=False)
+    monkeypatch.setattr(
+        run_bop,
+        "load_onboarding_templates",
+        fake_load_templates,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        run_bop,
+        "aggregate_query_visual_features_streaming",
+        fake_aggregate,
+        raising=False,
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "extract-query-visual",
+        "--dataset",
+        "lmo",
+        "--obj-id",
+        "1",
+        "--layer",
+        "30",
+        "--depth-tolerance",
+        "1.0",
+        "--onboarding-cache",
+        str(onboarding),
+        "--rgb-dir",
+        str(rgb_dir),
+        "--dinov2-root",
+        str(dinov2_root),
+        "--output",
+        str(output),
+    ])
+
+    run_bop.main()
+
+    assert calls["dino"] == ("cuda", 30, "token", dinov2_root)
+    assert calls["templates"] == (onboarding, rgb_dir)
+    assert calls["aggregate"] == (1.0, 18, None, "inverse_bilinear")
+    with np.load(output, allow_pickle=False) as data:
+        assert data["query_points"].shape == (6, 3)
+        assert data["visual_features"].shape == (6, 12)
+        np.testing.assert_array_equal(data["view_counts"], np.full(6, 21))
+        assert int(data["dino_layer"]) == 30
+        assert str(data["dino_facet"]) == "token"
+        assert float(data["depth_tolerance"]) == 1.0
+        assert int(data["min_views"]) == 18
+        assert str(data["depth_sampling"]) == "inverse_bilinear"
