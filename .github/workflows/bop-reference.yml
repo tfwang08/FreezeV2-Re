@@ -26,6 +26,7 @@ on:
       - "tests/test_run_bop.py"
       - "tests/test_target_cli.py"
       - "tests/test_pose_cli.py"
+      - "tests/test_refine_cli.py"
   pull_request:
     branches: [main]
     paths:
@@ -51,6 +52,7 @@ on:
       - "tests/test_run_bop.py"
       - "tests/test_target_cli.py"
       - "tests/test_pose_cli.py"
+      - "tests/test_refine_cli.py"
   workflow_dispatch:
 
 jobs:
