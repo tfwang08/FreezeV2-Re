@@ -201,3 +201,56 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         assert int(data["grid_size"]) == 16
         assert int(data["dense_size_requested"]) == 3000
         assert np.isfinite(target).all()
+
+
+def test_visualize_target_writes_overlay_and_reports_geometry(tmp_path, monkeypatch, capsys):
+    rgb_path = tmp_path / "rgb.png"
+    mask_path = tmp_path / "mask.png"
+    output = tmp_path / "overlay.png"
+    cache_path = tmp_path / "target.npz"
+
+    rgb = np.full((30, 40, 3), 40, dtype=np.uint8)
+    mask = np.zeros((30, 40), dtype=np.uint8)
+    mask[5:25, 8:32] = 255
+    Image.fromarray(rgb).save(rgb_path)
+    Image.fromarray(mask).save(mask_path)
+
+    image_xy = np.array([[10.5, 8.5], [20.5, 15.5], [30.5, 22.5]], dtype=np.float32)
+    points = np.array([
+        [-5.0, -2.0, 400.0],
+        [0.0, 1.0, 410.0],
+        [6.0, 3.0, 420.0],
+    ], dtype=np.float32)
+    np.savez_compressed(
+        cache_path,
+        sparse_image_xy=image_xy,
+        sparse_points=points,
+        rgb_source=np.array(str(rgb_path)),
+        mask_source=np.array(str(mask_path)),
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "visualize-target",
+        "--target-cache",
+        str(cache_path),
+        "--output",
+        str(output),
+        "--radius",
+        "2",
+    ])
+
+    run_bop.main()
+
+    assert output.is_file()
+    rendered = np.asarray(Image.open(output).convert("RGB"))
+    assert rendered.shape == (30, 40, 3)
+    assert not np.array_equal(rendered, rgb)
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["point_count"] == 3
+    assert report["inside_mask_count"] == 3
+    assert report["inside_mask_fraction"] == 1.0
+    np.testing.assert_allclose(report["xyz_min"], [-5.0, -2.0, 400.0])
+    np.testing.assert_allclose(report["xyz_max"], [6.0, 3.0, 420.0])
+    assert report["output"] == str(output)
