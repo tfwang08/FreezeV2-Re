@@ -91,7 +91,7 @@ def _inlier_mask(
 
 def _score_hypothesis(pose, query_points, query_features, target_points, target_features,
                       candidate_query_indices, inlier_threshold: float) -> float:
-    """FreeZeV2 Eq. (5) feature-aware coarse-pose score.
+    """FreeZeV2 Eq. (5) feature-aware coarse/fine pose score.
 
     Every top-k correspondence whose transformed query point is inside the
     geometric inlier threshold contributes its cosine similarity. The total is
@@ -110,6 +110,160 @@ def _score_hypothesis(pose, query_points, query_features, target_points, target_
     tf = target_features[:, None, :]
     cosine = np.sum(qf * tf, axis=2)
     return float(np.sum(cosine[inliers]) / len(target_points))
+
+
+def feature_pose_score(
+    pose: np.ndarray,
+    query_points: np.ndarray,
+    query_features: np.ndarray,
+    target_points: np.ndarray,
+    target_features: np.ndarray,
+    candidate_query_indices: np.ndarray,
+    inlier_threshold: float,
+) -> float:
+    """Evaluate Eq. (5) with the same row-wise L2 normalization as RANSAC."""
+    return _score_hypothesis(
+        np.asarray(pose, dtype=np.float64),
+        np.asarray(query_points, dtype=np.float64),
+        _normalize(query_features),
+        np.asarray(target_points, dtype=np.float64),
+        _normalize(target_features),
+        np.asarray(candidate_query_indices, dtype=np.int64),
+        float(inlier_threshold),
+    )
+
+
+def _nearest_neighbor_indices(
+    source: np.ndarray,
+    target: np.ndarray,
+    chunk_size: int = 512,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact nearest neighbors using bounded-memory NumPy matrix products."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("source must have shape Nx3")
+    if target.ndim != 2 or target.shape[1] != 3 or len(target) == 0:
+        raise ValueError("target must have non-empty shape Mx3")
+    if not np.isfinite(source).all() or not np.isfinite(target).all():
+        raise ValueError("nearest-neighbor inputs must be finite")
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    target_sq = np.einsum("ij,ij->i", target, target)
+    indices = np.empty(len(source), dtype=np.int64)
+    distances = np.empty(len(source), dtype=np.float64)
+    target_t = target.T
+    for start in range(0, len(source), chunk_size):
+        stop = min(start + chunk_size, len(source))
+        block = source[start:stop]
+        block_sq = np.einsum("ij,ij->i", block, block)
+        d2 = block_sq[:, None] + target_sq[None, :] - 2.0 * (block @ target_t)
+        np.maximum(d2, 0.0, out=d2)
+        local = np.argmin(d2, axis=1)
+        row = np.arange(len(block))
+        indices[start:stop] = local
+        distances[start:stop] = np.sqrt(d2[row, local])
+    return indices, distances
+
+
+def point_to_point_icp(
+    query_points: np.ndarray,
+    dense_target_points: np.ndarray,
+    initial_pose: np.ndarray,
+    max_correspondence_distance: float,
+    max_iterations: int = 30,
+    chunk_size: int = 512,
+) -> tuple[np.ndarray, float, dict]:
+    """Refine a coarse model-to-camera pose with deterministic point-to-point ICP.
+
+    FreeZeV2 publishes the correspondence threshold (3% of object diameter)
+    but not its ICP convergence settings.  This implementation therefore keeps
+    the iteration cap explicit and uses only an exact, parameter-free stopping
+    rule: stop once the gated nearest-neighbor correspondence set no longer
+    changes.  ``S_ICP`` follows Eq. (6): the number of query points whose final
+    nearest target point is within the threshold, divided by ``|P_Q|``.
+    """
+    query = np.asarray(query_points, dtype=np.float64)
+    target = np.asarray(dense_target_points, dtype=np.float64)
+    pose = np.asarray(initial_pose, dtype=np.float64).copy()
+    threshold = float(max_correspondence_distance)
+    max_iterations = int(max_iterations)
+
+    if query.ndim != 2 or query.shape[1] != 3 or len(query) < 3:
+        raise ValueError("query_points must have shape Nx3 with N >= 3")
+    if target.ndim != 2 or target.shape[1] != 3 or len(target) < 3:
+        raise ValueError("dense_target_points must have shape Mx3 with M >= 3")
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        raise ValueError("initial_pose must be a finite 4x4 matrix")
+    if not np.isfinite(query).all() or not np.isfinite(target).all():
+        raise ValueError("ICP point clouds must be finite")
+    if threshold <= 0.0 or not np.isfinite(threshold):
+        raise ValueError("max_correspondence_distance must be positive and finite")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+
+    previous_indices = None
+    previous_inliers = None
+    iterations_run = 0
+    converged = False
+
+    for _ in range(max_iterations):
+        transformed = query @ pose[:3, :3].T + pose[:3, 3]
+        nearest_indices, distances = _nearest_neighbor_indices(
+            transformed,
+            target,
+            chunk_size=chunk_size,
+        )
+        inliers = distances < threshold
+        if int(inliers.sum()) < 3:
+            break
+        if (
+            previous_indices is not None
+            and np.array_equal(nearest_indices, previous_indices)
+            and np.array_equal(inliers, previous_inliers)
+        ):
+            converged = True
+            break
+
+        try:
+            R, t = kabsch(query[inliers], target[nearest_indices[inliers]])
+        except np.linalg.LinAlgError:
+            break
+        updated = np.eye(4, dtype=np.float64)
+        updated[:3, :3] = R
+        updated[:3, 3] = t
+        pose = updated
+        iterations_run += 1
+        previous_indices = nearest_indices
+        previous_inliers = inliers
+
+    transformed = query @ pose[:3, :3].T + pose[:3, 3]
+    final_indices, final_distances = _nearest_neighbor_indices(
+        transformed,
+        target,
+        chunk_size=chunk_size,
+    )
+    final_inliers = final_distances < threshold
+    inlier_count = int(final_inliers.sum())
+    icp_score = float(inlier_count / len(query))
+    rmse = (
+        float(np.sqrt(np.mean(final_distances[final_inliers] ** 2)))
+        if inlier_count
+        else float("inf")
+    )
+    debug = {
+        "inlier_count": inlier_count,
+        "inlier_ratio": icp_score,
+        "rmse": rmse,
+        "iterations_run": int(iterations_run),
+        "max_iterations": int(max_iterations),
+        "max_correspondence_distance": threshold,
+        "converged": bool(converged),
+        "nearest_target_indices": final_indices,
+    }
+    return pose, icp_score, debug
 
 
 def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
