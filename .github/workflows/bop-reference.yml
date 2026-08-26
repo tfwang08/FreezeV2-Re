@@ -1,5 +1,5 @@
 name: BOP reference check
-# FreeZeV2 query visual regression is covered by this workflow.
+# FreeZeV2 query visual and DINO-backbone A/B regressions are covered here.
 
 on:
   push:
