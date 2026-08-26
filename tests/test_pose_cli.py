@@ -77,16 +77,33 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
         k=10,
         iterations=10_000,
         seed=0,
+        edge_tolerance=None,
+        return_debug=False,
     ):
         np.testing.assert_array_equal(query_points_arg, query_points)
         np.testing.assert_array_equal(query_features_arg, query_features)
         np.testing.assert_array_equal(target_points_arg, target_points)
         np.testing.assert_array_equal(target_features_arg, target_features)
-        calls["estimate"] = (object_diameter, k, iterations, seed)
+        calls["estimate"] = (
+            object_diameter,
+            k,
+            iterations,
+            seed,
+            edge_tolerance,
+            return_debug,
+        )
         pose = np.eye(4, dtype=np.float64)
         pose[:3, :3] = gt_R
         pose[:3, 3] = gt_t
-        return pose, 2.75
+        debug = {
+            "winning_target_indices": np.array([0, 1, 2], dtype=np.int64),
+            "winning_candidate_columns": np.array([0, 1, 2], dtype=np.int64),
+            "winning_query_indices": np.array([0, 1, 2], dtype=np.int64),
+            "inlier_count": 7,
+            "inlier_target_count": 4,
+            "edge_tolerance": 3.0,
+        }
+        return pose, 2.75, debug
 
     monkeypatch.setattr(run_bop, "topk_cosine_matches", fake_topk, raising=False)
     monkeypatch.setattr(run_bop, "estimate_pose_from_features", fake_estimate, raising=False)
@@ -116,7 +133,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
     run_bop.main()
 
     assert calls["topk"] == ((4, 128), (12, 128), 10)
-    assert calls["estimate"] == (100.0, 10, 10_000, 0)
+    assert calls["estimate"] == (100.0, 10, 10_000, 0, 3.0, True)
 
     with np.load(output, allow_pickle=False) as data:
         np.testing.assert_allclose(data["coarse_pose"], np.block([
@@ -127,15 +144,24 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
         np.testing.assert_allclose(data["candidate_similarities"], candidate_sim)
         assert float(data["coarse_score"]) == 2.75
         np.testing.assert_allclose(float(data["inlier_threshold"]), 3.0)
+        np.testing.assert_allclose(float(data["edge_tolerance"]), 3.0)
         assert int(data["top_k"]) == 10
         assert int(data["iterations"]) == 10_000
         assert int(data["gt_id"]) == 0
+        assert int(data["inlier_count"]) == 7
+        assert int(data["inlier_target_count"]) == 4
+        np.testing.assert_array_equal(data["winning_target_indices"], [0, 1, 2])
+        np.testing.assert_array_equal(data["winning_candidate_columns"], [0, 1, 2])
+        np.testing.assert_array_equal(data["winning_query_indices"], [0, 1, 2])
         np.testing.assert_allclose(float(data["rotation_error_deg"]), 0.0, atol=1e-10)
         np.testing.assert_allclose(float(data["translation_error_mm"]), 0.0, atol=1e-10)
 
     report = json.loads(capsys.readouterr().out)
     assert report["top_k"] == 10
     assert report["iterations"] == 10_000
+    assert report["inlier_count"] == 7
+    assert report["inlier_target_count"] == 4
     np.testing.assert_allclose(report["inlier_threshold"], 3.0)
+    np.testing.assert_allclose(report["edge_tolerance"], 3.0)
     np.testing.assert_allclose(report["rotation_error_deg"], 0.0, atol=1e-10)
     np.testing.assert_allclose(report["translation_error_mm"], 0.0, atol=1e-10)
