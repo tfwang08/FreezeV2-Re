@@ -25,15 +25,7 @@ from freezev2.geometry import backproject_depth
 from freezev2.matching import topk_cosine_matches
 from freezev2.onboard import load_onboarding_templates
 from freezev2.pipeline import estimate_pose_from_features
-from freezev2.query_crop import (
-    QUERY_DINO_INPUT_SIZE,
-    QUERY_DINO_MODE,
-    QUERY_DINO_PATCH_GRID,
-)
-from freezev2.query_features import (
-    aggregate_query_visual_features_pixel_lifting_streaming,
-    aggregate_query_visual_features_streaming,
-)
+from freezev2.query_features import aggregate_query_visual_features_streaming
 from freezev2.refinement import refine_pose_cache
 from freezev2.target_cli import extract_target_cache
 from freezev2.target_features import target_patch_grid as _target_patch_grid
@@ -938,72 +930,49 @@ def main() -> None:
             facet=args.facet,
             repo_or_dir=args.dinov2_root,
         )
-        (
-            kept_points,
-            visual_view_uniform,
-            visual_pixel_support,
-            view_counts,
-            pixel_support_counts,
-        ) = aggregate_query_visual_features_pixel_lifting_streaming(
-            query_points,
-            templates,
-            extractor,
-            min_views=args.min_views,
+        kept_points, visual_features, view_counts = (
+            aggregate_query_visual_features_streaming(
+                query_points,
+                templates,
+                extractor,
+                depth_tolerance=args.depth_tolerance,
+                min_views=args.min_views,
+                view_weights=None,
+                depth_sampling=args.depth_sampling,
+            )
         )
         kept_points = np.asarray(kept_points, dtype=np.float32)
-        visual_view_uniform = np.asarray(visual_view_uniform, dtype=np.float32)
-        visual_pixel_support = np.asarray(visual_pixel_support, dtype=np.float32)
+        visual_features = np.asarray(visual_features, dtype=np.float32)
         view_counts = np.asarray(view_counts, dtype=np.int32)
-        pixel_support_counts = np.asarray(pixel_support_counts, dtype=np.int64)
-        visual_features = visual_view_uniform
 
         if kept_points.ndim != 2 or kept_points.shape[1] != 3:
             raise RuntimeError(f"unexpected visual query-point shape: {kept_points.shape}")
-        for name, features in (
-            ("view-uniform", visual_view_uniform),
-            ("pixel-support", visual_pixel_support),
-        ):
-            if features.ndim != 2 or len(features) != len(kept_points):
-                raise RuntimeError(
-                    f"unexpected {name} query visual-feature shape: {features.shape}"
-                )
-            if not np.isfinite(features).all():
-                raise RuntimeError(f"{name} query visual features contain non-finite values")
-        if visual_view_uniform.shape != visual_pixel_support.shape:
-            raise RuntimeError("query visual aggregation branches have different shapes")
+        if visual_features.ndim != 2 or len(visual_features) != len(kept_points):
+            raise RuntimeError(
+                f"unexpected query visual-feature shape: {visual_features.shape}"
+            )
         if view_counts.shape != (len(kept_points),):
             raise RuntimeError(f"unexpected view-count shape: {view_counts.shape}")
-        if pixel_support_counts.shape != (len(kept_points),):
-            raise RuntimeError(
-                f"unexpected pixel-support-count shape: {pixel_support_counts.shape}"
-            )
+        if not np.isfinite(visual_features).all():
+            raise RuntimeError("query visual features contain non-finite values")
 
         output.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             output,
             query_points=kept_points,
             visual_features=visual_features,
-            visual_features_view_uniform=visual_view_uniform,
-            visual_features_pixel_support=visual_pixel_support,
             view_counts=view_counts,
-            pixel_support_counts=pixel_support_counts,
-            visual_aggregation=np.array("tight_crop_224_pixel_lift_nn_view_uniform"),
-            visual_weighting_candidate=np.array("pixel_support"),
-            query_dino_mode=np.array(QUERY_DINO_MODE),
-            query_dino_input_hw=np.asarray(
-                [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE], dtype=np.int32
-            ),
-            query_dino_patch_grid=np.asarray(
-                [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID], dtype=np.int32
-            ),
+            visual_aggregation=np.array("freezv2_3d_to_2d_visible_view_uniform"),
+            query_sampling_mode=np.array("3d_to_2d_projection"),
+            query_visibility=np.array("rendered_depth"),
             dino_layer=np.int32(args.layer),
             dino_facet=np.array(args.facet),
             dino_model=np.array(DINOV2_MODEL_NAME),
             dino_commit=np.array(DINOV2_FOUNDPOSE_COMMIT),
             device=np.array(args.device),
             min_views=np.int32(args.min_views),
-            legacy_depth_tolerance=np.float32(args.depth_tolerance),
-            legacy_depth_sampling=np.array(args.depth_sampling),
+            depth_tolerance=np.float32(args.depth_tolerance),
+            depth_sampling=np.array(args.depth_sampling),
             num_templates=np.int32(len(templates)),
             input_query_count=np.int32(len(query_points)),
             onboarding_source=np.array(str(cache_path)),
@@ -1016,28 +985,18 @@ def main() -> None:
             "dino_model": DINOV2_MODEL_NAME,
             "input_query_points": list(query_points.shape),
             "retained_query_points": list(kept_points.shape),
-            "visual_features": list(visual_view_uniform.shape),
-            "visual_features_pixel_support": list(visual_pixel_support.shape),
+            "visual_features": list(visual_features.shape),
             "view_count_range": [
                 int(view_counts.min()) if len(view_counts) else 0,
                 int(view_counts.max()) if len(view_counts) else 0,
             ],
-            "pixel_support_count_range": [
-                int(pixel_support_counts.min()) if len(pixel_support_counts) else 0,
-                int(pixel_support_counts.max()) if len(pixel_support_counts) else 0,
-            ],
-            "visual_aggregation": "tight_crop_224_pixel_lift_nn_view_uniform",
-            "visual_weighting_candidate": "pixel_support",
-            "query_dino_mode": QUERY_DINO_MODE,
-            "query_dino_input_hw": [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE],
-            "query_dino_patch_grid": [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID],
+            "visual_aggregation": "freezv2_3d_to_2d_visible_view_uniform",
+            "query_sampling_mode": "3d_to_2d_projection",
+            "query_visibility": "rendered_depth",
             "min_views": args.min_views,
-            "legacy_depth_tolerance": args.depth_tolerance,
-            "legacy_depth_sampling": args.depth_sampling,
-            "finite": bool(
-                np.isfinite(visual_view_uniform).all()
-                and np.isfinite(visual_pixel_support).all()
-            ),
+            "depth_tolerance": args.depth_tolerance,
+            "depth_sampling": args.depth_sampling,
+            "finite": bool(np.isfinite(visual_features).all()),
             "output": str(output),
         }, indent=2, sort_keys=True))
         return
@@ -1144,6 +1103,8 @@ def main() -> None:
                 "view_counts",
                 "pixel_support_counts",
                 "visual_aggregation",
+                "query_sampling_mode",
+                "query_visibility",
                 "visual_weighting_candidate",
                 "query_dino_mode",
                 "query_dino_input_hw",
