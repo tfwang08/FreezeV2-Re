@@ -7,9 +7,10 @@ set -eo pipefail
 # Blackwell (RTX 50-series, sm_120): Python 3.11 + PyTorch 2.7.1/CUDA 12.8.
 #
 # PointNet2 is built from the exact source vendored by the pinned GeDi commit
-# for the detected GPU architecture. The matching CUDA compiler is installed
-# into an isolated toolkit prefix instead of the freeze conda environment, so
-# unrelated cuda-toolkit meta-packages cannot perturb dependency resolution.
+# for the detected GPU architecture. The matching CUDA compiler, development
+# libraries, and a CUDA-compatible GCC/G++ 12 toolchain are installed into an
+# isolated prefix instead of the freeze conda environment. This keeps unrelated
+# cuda-toolkit/compiler packages in freeze from perturbing the extension build.
 # GeDi's Open3D-ML radius search is replaced in freezev2.gedi_bridge by an
 # equivalent CPU torch search, so the Blackwell profile is not blocked by
 # Open3D 0.19's PyTorch-2.2 ABI.
@@ -292,6 +293,21 @@ _nvcc_minor_at() {
     "$1" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1
 }
 
+_cuda_header_exists() {
+    local root="$1"
+    local header="$2"
+    [[ -f "$root/include/$header" || -f "$root/targets/x86_64-linux/include/$header" ]]
+}
+
+_isolated_toolchain_ready() {
+    local nvcc_path="$CUDA_TOOLKIT_PREFIX/bin/nvcc"
+    [[ -x "$nvcc_path" ]] || return 1
+    [[ "$(_nvcc_minor_at "$nvcc_path")" == "$CUDA_VERSION" ]] || return 1
+    _cuda_header_exists "$CUDA_TOOLKIT_PREFIX" "cusparse.h" || return 1
+    [[ -x "$CUDA_TOOLKIT_PREFIX/bin/x86_64-conda-linux-gnu-cc" ]] || return 1
+    [[ -x "$CUDA_TOOLKIT_PREFIX/bin/x86_64-conda-linux-gnu-c++" ]] || return 1
+}
+
 _prepare_cuda_toolkit() {
     local nvcc_path=""
     local current=""
@@ -304,58 +320,85 @@ _prepare_cuda_toolkit() {
             return 3
         fi
         current="$(_nvcc_minor_at "$nvcc_path")"
-    else
-        nvcc_path="$CUDA_TOOLKIT_PREFIX/bin/nvcc"
-        if [[ -x "$nvcc_path" ]]; then
-            current="$(_nvcc_minor_at "$nvcc_path")"
-        fi
-
         if [[ "$current" != "$CUDA_VERSION" ]]; then
-            echo "[FreezeV2-Re] preparing isolated CUDA $CUDA_VERSION compiler at $CUDA_TOOLKIT_PREFIX."
+            echo "[FreezeV2-Re] STOP: FREEZEV2_CUDA_HOME provides nvcc ${current:-unknown}, expected $CUDA_VERSION." >&2
+            return 3
+        fi
+        if ! _cuda_header_exists "$CUDA_HOME" "cusparse.h"; then
+            echo "[FreezeV2-Re] STOP: FREEZEV2_CUDA_HOME is missing cusparse.h; a full CUDA development toolkit is required." >&2
+            return 3
+        fi
+    else
+        if ! _isolated_toolchain_ready; then
+            echo "[FreezeV2-Re] preparing complete isolated CUDA $CUDA_VERSION build toolchain at $CUDA_TOOLKIT_PREFIX."
             mkdir -p "$(dirname "$CUDA_TOOLKIT_PREFIX")"
 
             if [[ -d "$CUDA_TOOLKIT_PREFIX/conda-meta" ]]; then
                 conda install -y -p "$CUDA_TOOLKIT_PREFIX" \
                     --override-channels \
                     -c "nvidia/label/$CUDA_CONDA_LABEL" \
-                    -c defaults \
+                    -c conda-forge \
                     "cuda-nvcc=${CUDA_VERSION}.*" \
                     "cuda-cudart-dev=${CUDA_VERSION}.*" \
-                    "cuda-cccl=${CUDA_VERSION}.*"
+                    "cuda-libraries-dev=${CUDA_VERSION}.*" \
+                    "cuda-cccl=${CUDA_VERSION}.*" \
+                    "gcc_linux-64=12.3.0" \
+                    "gxx_linux-64=12.3.0"
             else
                 rm -rf "$CUDA_TOOLKIT_PREFIX"
                 conda create -y -p "$CUDA_TOOLKIT_PREFIX" \
                     --override-channels \
                     -c "nvidia/label/$CUDA_CONDA_LABEL" \
-                    -c defaults \
+                    -c conda-forge \
                     "cuda-nvcc=${CUDA_VERSION}.*" \
                     "cuda-cudart-dev=${CUDA_VERSION}.*" \
-                    "cuda-cccl=${CUDA_VERSION}.*"
-            fi
-
-            nvcc_path="$CUDA_TOOLKIT_PREFIX/bin/nvcc"
-            if [[ -x "$nvcc_path" ]]; then
-                current="$(_nvcc_minor_at "$nvcc_path")"
-            else
-                current=""
+                    "cuda-libraries-dev=${CUDA_VERSION}.*" \
+                    "cuda-cccl=${CUDA_VERSION}.*" \
+                    "gcc_linux-64=12.3.0" \
+                    "gxx_linux-64=12.3.0"
             fi
         fi
 
+        if ! _isolated_toolchain_ready; then
+            echo "[FreezeV2-Re] STOP: isolated CUDA/GCC toolchain is incomplete at $CUDA_TOOLKIT_PREFIX." >&2
+            return 3
+        fi
+
         export CUDA_HOME="$CUDA_TOOLKIT_PREFIX"
+        export CC="$CUDA_TOOLKIT_PREFIX/bin/x86_64-conda-linux-gnu-cc"
+        export CXX="$CUDA_TOOLKIT_PREFIX/bin/x86_64-conda-linux-gnu-c++"
+        export CUDAHOSTCXX="$CXX"
+        export NVCC_CCBIN="$CC"
     fi
 
     export PATH="$CUDA_HOME/bin:$PATH"
+    if [[ -d "$CUDA_HOME/targets/x86_64-linux/include" ]]; then
+        export CPATH="$CUDA_HOME/targets/x86_64-linux/include:$CUDA_HOME/include${CPATH:+:$CPATH}"
+    else
+        export CPATH="$CUDA_HOME/include${CPATH:+:$CPATH}"
+    fi
+    if [[ -d "$CUDA_HOME/targets/x86_64-linux/lib" ]]; then
+        export LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        export LD_LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
 
+    current="$(_nvcc_minor_at "$CUDA_HOME/bin/nvcc")"
     if [[ "$current" != "$CUDA_VERSION" ]]; then
         echo "[FreezeV2-Re] STOP: nvcc $CUDA_VERSION is required to build PointNet2 for $PROFILE." >&2
         echo "[FreezeV2-Re] current nvcc: ${current:-not found}" >&2
-        echo "[FreezeV2-Re] set FREEZEV2_CUDA_HOME to a matching CUDA toolkit if needed." >&2
+        echo "[FreezeV2-Re] set FREEZEV2_CUDA_HOME to a matching full CUDA toolkit if needed." >&2
         return 3
     fi
 
     echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
     echo "[FreezeV2-Re] nvcc: $CUDA_HOME/bin/nvcc"
     echo "[FreezeV2-Re] nvcc CUDA: $current"
+    if [[ -n "${CC:-}" ]]; then
+        echo "[FreezeV2-Re] host C compiler: $CC"
+    fi
+    if [[ -n "${CXX:-}" ]]; then
+        echo "[FreezeV2-Re] host C++ compiler: $CXX"
+    fi
 }
 
 _pointnet_ready() {
