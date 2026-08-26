@@ -252,3 +252,355 @@ def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, mo
         assert float(data["depth_tolerance"]) == 1.0
         assert str(np.asarray(data["depth_sampling"]).item()) == "inverse_bilinear"
         assert int(data["min_views"]) == 18
+
+
+# --- downloaded-mask multi-candidate regression tests ---
+
+def test_decode_uncompressed_coco_rle_uses_fortran_order():
+    segmentation = {"size": [2, 3], "counts": [1, 3, 2]}
+    decoded = run_bop._decode_uncompressed_coco_rle(segmentation)
+    expected = np.array(
+        [[False, True, False], [True, True, False]],
+        dtype=bool,
+    )
+    np.testing.assert_array_equal(decoded, expected)
+
+
+def test_decode_uncompressed_coco_rle_rejects_compressed_counts():
+    import pytest
+
+    with pytest.raises(ValueError, match="compressed"):
+        run_bop._decode_uncompressed_coco_rle(
+            {"size": [2, 2], "counts": "encoded-rle"}
+        )
+
+
+def test_detection_filtering_sorts_and_truncates_per_source(tmp_path):
+    detections = [
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.4,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.9,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.8,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 4,
+            "score": 0.99,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+    ]
+    path = tmp_path / "detections.json"
+    path.write_text(json.dumps(detections))
+
+    selected = run_bop._load_detection_candidates(
+        path,
+        scene_id=1,
+        im_id=2,
+        obj_id=3,
+        limit=2,
+    )
+
+    assert [item["source_detection_index"] for item in selected] == [1, 2]
+    assert [item["segmentation_confidence"] for item in selected] == [0.9, 0.8]
+
+
+def test_localization_instance_count_reads_bop_targets(tmp_path):
+    path = tmp_path / "test_targets_bop19.json"
+    path.write_text(json.dumps([
+        {"scene_id": 1, "im_id": 2, "obj_id": 3, "inst_count": 2},
+        {"scene_id": 1, "im_id": 2, "obj_id": 4, "inst_count": 1},
+    ]))
+
+    assert run_bop._load_localization_instance_count(
+        path,
+        scene_id=1,
+        im_id=2,
+        obj_id=3,
+    ) == 2
+
+
+def test_translation_nms_orders_by_final_score_not_segmentation_confidence():
+    candidates = [
+        {
+            "final_score": 0.7,
+            "segmentation_confidence": 0.99,
+            "t_mm": [0.0, 0.0, 0.0],
+        },
+        {
+            "final_score": 0.9,
+            "segmentation_confidence": 0.10,
+            "t_mm": [1.0, 0.0, 0.0],
+        },
+        {
+            "final_score": 0.8,
+            "segmentation_confidence": 0.50,
+            "t_mm": [100.0, 0.0, 0.0],
+        },
+    ]
+
+    selected, suppressed_by = run_bop._translation_nms(
+        candidates,
+        threshold_mm=5.0,
+        max_count=2,
+    )
+
+    assert selected == [1, 2]
+    assert suppressed_by[0] == 1
+    assert suppressed_by[1] is None
+    assert suppressed_by[2] is None
+
+
+def test_download_default_masks_extracts_expected_member_and_skips_valid_file(
+    tmp_path,
+    monkeypatch,
+):
+    import io
+    import zipfile
+
+    payload = json.dumps([{
+        "scene_id": 1,
+        "image_id": 2,
+        "category_id": 3,
+        "score": 0.9,
+        "segmentation": {"size": [2, 2], "counts": [0, 4]},
+    }]).encode()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "cnos-fastsam/cnos-fastsam_lmo_test.json",
+            payload,
+        )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return buffer.getvalue()
+
+    calls = {"count": 0}
+
+    def fake_urlopen(_url):
+        calls["count"] += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(run_bop.urllib.request, "urlopen", fake_urlopen)
+    output_dir = tmp_path / "detections" / "cnos-fastsam"
+
+    first = run_bop._download_default_masks("lmo", output_dir, force=False)
+    second = run_bop._download_default_masks("lmo", output_dir, force=False)
+
+    output = output_dir / "cnos-fastsam_lmo-test.json"
+    assert output.is_file()
+    assert json.loads(output.read_text())[0]["category_id"] == 3
+    assert first["skipped"] is False
+    assert second["skipped"] is True
+    assert calls["count"] == 1
+
+
+def test_estimate_multi_mask_continues_bad_candidate_and_ranks_by_final_score(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    bop_root = tmp_path / "bop"
+    dataset_root = bop_root / "lmo"
+    dataset_root.mkdir(parents=True)
+    (dataset_root / "test_targets_bop19.json").write_text(json.dumps([
+        {"scene_id": 1, "im_id": 2, "obj_id": 3, "inst_count": 2},
+    ]))
+    detections = tmp_path / "detections.json"
+    detections.write_text(json.dumps([
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.95,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.90,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+        {
+            "scene_id": 1,
+            "image_id": 2,
+            "category_id": 3,
+            "score": 0.10,
+            "segmentation": {"size": [2, 2], "counts": [0, 4]},
+        },
+    ]))
+
+    def fake_invoke(argv):
+        command = argv[0]
+        output = Path(argv[argv.index("--output") + 1])
+        candidate_index = int(output.stem.split("_")[1])
+        if command == "extract-target":
+            if candidate_index == 1:
+                raise ValueError("bad candidate")
+            return {"output": str(output)}
+        if command == "estimate-coarse-pose":
+            return {
+                "coarse_score": {0: 0.2, 2: 0.3}[candidate_index],
+                "output": str(output),
+            }
+        if command == "refine-pose":
+            final_score = {0: 0.4, 2: 0.9}[candidate_index]
+            translation = {0: [0.0, 0.0, 0.0], 2: [100.0, 0.0, 0.0]}[
+                candidate_index
+            ]
+            return {
+                "coarse_feature_score": {0: 0.2, 2: 0.3}[candidate_index],
+                "fine_feature_score": 0.8,
+                "icp_score": 0.7,
+                "final_score": final_score,
+                "R": np.eye(3).tolist(),
+                "t_mm": translation,
+                "output": str(output),
+            }
+        raise AssertionError(command)
+
+    monkeypatch.setattr(run_bop, "_invoke_main_command", fake_invoke)
+    work_dir = tmp_path / "multi"
+    output = work_dir / "result.json"
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "estimate-multi-mask",
+        "--dataset",
+        "lmo",
+        "--scene-id",
+        "1",
+        "--im-id",
+        "2",
+        "--obj-id",
+        "3",
+        "--bop-root",
+        str(bop_root),
+        "--detection-json",
+        str(detections),
+        "--nms-translation-threshold-mm",
+        "5",
+        "--work-dir",
+        str(work_dir),
+        "--output",
+        str(output),
+    ])
+
+    run_bop.main()
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["instance_count"] == 2
+    assert report["candidate_limit_per_source"] == 3
+    assert report["candidate_count"] == 3
+    assert report["valid_candidate_count"] == 2
+    assert report["candidates"][1]["status"] == "invalid"
+    assert "bad candidate" in report["candidates"][1]["error"]
+    assert [item["candidate_index"] for item in report["selected"]] == [2, 0]
+    assert report["selected"][0]["segmentation_confidence"] == 0.10
+    assert report["selected_count"] == 2
+    assert output.is_file()
+
+
+def test_coarse_cache_persists_similarity_means(tmp_path, monkeypatch):
+    query_cache = tmp_path / "query.npz"
+    target_cache = tmp_path / "target.npz"
+    output = tmp_path / "coarse.npz"
+    query_points = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    features = np.array(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=np.float32,
+    )
+    np.savez_compressed(
+        query_cache,
+        query_points=query_points,
+        fused_features=features,
+        diameter=np.float32(100.0),
+    )
+    np.savez_compressed(
+        target_cache,
+        sparse_points=query_points.copy(),
+        target_features=features.copy(),
+        scene_id=np.int32(1),
+        im_id=np.int32(2),
+        obj_id=np.int32(3),
+    )
+    candidate_idx = np.array([[0, 1], [1, 2], [2, 0]], dtype=np.int64)
+    candidate_sim = np.array(
+        [[0.9, 0.4], [0.8, 0.3], [0.7, 0.2]],
+        dtype=np.float64,
+    )
+
+    monkeypatch.setattr(
+        run_bop,
+        "topk_cosine_matches",
+        lambda *_args, **_kwargs: (candidate_idx, candidate_sim),
+    )
+
+    def fake_estimate(*_args, **_kwargs):
+        return np.eye(4), 0.5, {
+            "edge_similarity_threshold": 0.9,
+            "winning_target_indices": np.array([0, 1, 2]),
+            "winning_candidate_columns": np.array([0, 0, 0]),
+            "winning_query_indices": np.array([0, 1, 2]),
+            "inlier_count": 3,
+            "inlier_target_count": 3,
+            "degenerate_triplets": 0,
+            "edge_pruned_triplets": 0,
+            "valid_hypotheses": 1,
+        }
+
+    monkeypatch.setattr(run_bop, "estimate_pose_from_features", fake_estimate)
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "estimate-coarse-pose",
+        "--dataset",
+        "lmo",
+        "--scene-id",
+        "1",
+        "--im-id",
+        "2",
+        "--obj-id",
+        "3",
+        "--query-cache",
+        str(query_cache),
+        "--target-cache",
+        str(target_cache),
+        "--top-k",
+        "2",
+        "--iterations",
+        "1",
+        "--output",
+        str(output),
+    ])
+
+    run_bop.main()
+
+    with np.load(output, allow_pickle=False) as data:
+        assert float(data["top1_similarity_mean"]) == np.mean(candidate_sim[:, 0])
+        assert float(data["kth_similarity_mean"]) == np.mean(candidate_sim[:, -1])

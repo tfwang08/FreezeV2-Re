@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
+import sys
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +102,502 @@ def _rotation_error_deg(predicted: np.ndarray, reference: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cosine)))
 
 
+DEFAULT_MASK_ARCHIVE_URL = (
+    "https://bop.felk.cvut.cz/media/data/bop_datasets_extra/"
+    "bop23_default_detections_for_task4.zip"
+)
+
+
+def _decode_uncompressed_coco_rle(segmentation: dict) -> np.ndarray:
+    if not isinstance(segmentation, dict):
+        raise ValueError("segmentation must be a COCO RLE object")
+    size = segmentation.get("size")
+    counts = segmentation.get("counts")
+    if not isinstance(size, (list, tuple)) or len(size) != 2:
+        raise ValueError("RLE size must be [H, W]")
+    try:
+        height, width = (int(size[0]), int(size[1]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RLE size must contain integers") from exc
+    if height <= 0 or width <= 0:
+        raise ValueError("RLE size values must be positive")
+    if isinstance(counts, (str, bytes)):
+        raise ValueError("compressed COCO RLE counts are not supported")
+    if not isinstance(counts, (list, tuple)):
+        raise ValueError("RLE counts must be an integer list")
+
+    flat = np.zeros(height * width, dtype=bool)
+    cursor = 0
+    foreground = False
+    for run_index, raw_count in enumerate(counts):
+        if isinstance(raw_count, bool) or not isinstance(
+            raw_count, (int, np.integer)
+        ):
+            raise ValueError(f"RLE count {run_index} is not an integer")
+        count = int(raw_count)
+        if count < 0:
+            raise ValueError(f"RLE count {run_index} is negative")
+        end = cursor + count
+        if end > flat.size:
+            raise ValueError("RLE counts exceed H*W")
+        if foreground and count:
+            flat[cursor:end] = True
+        cursor = end
+        foreground = not foreground
+    if cursor != flat.size:
+        raise ValueError(
+            f"RLE counts sum to {cursor}, expected {flat.size} (= H*W)"
+        )
+    return flat.reshape((height, width), order="F")
+
+
+def _load_detection_candidates(
+    path: Path,
+    *,
+    scene_id: int,
+    im_id: int,
+    obj_id: int,
+    limit: int,
+) -> list[dict]:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"detection JSON not found: {path}")
+    if int(limit) < 0:
+        raise ValueError("candidate limit must be non-negative")
+    records = json.loads(path.read_text())
+    if not isinstance(records, list):
+        raise ValueError(f"detection JSON must contain a list: {path}")
+
+    selected = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"detection {index} in {path} is not an object")
+        required = ("scene_id", "category_id", "score", "segmentation")
+        missing = [key for key in required if key not in record]
+        if "image_id" not in record and "im_id" not in record:
+            missing.append("image_id")
+        if missing:
+            raise ValueError(
+                f"detection {index} in {path} is missing: {', '.join(missing)}"
+            )
+        record_im_id = record.get("image_id", record.get("im_id"))
+        if (
+            int(record["scene_id"]) != int(scene_id)
+            or int(record_im_id) != int(im_id)
+            or int(record["category_id"]) != int(obj_id)
+        ):
+            continue
+        score = float(record["score"])
+        if not np.isfinite(score) or score < 0.0:
+            raise ValueError(
+                f"detection {index} in {path} has invalid score {score}"
+            )
+        selected.append({
+            "source_name": path.stem,
+            "source_path": str(path),
+            "source_detection_index": index,
+            "segmentation_confidence": score,
+            "segmentation": record["segmentation"],
+        })
+    selected.sort(
+        key=lambda item: (
+            -item["segmentation_confidence"],
+            item["source_detection_index"],
+        )
+    )
+    return selected[: int(limit)]
+
+
+def _load_localization_instance_count(
+    path: Path,
+    *,
+    scene_id: int,
+    im_id: int,
+    obj_id: int,
+) -> int:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"BOP localization targets not found: {path}")
+    targets = json.loads(path.read_text())
+    if not isinstance(targets, list):
+        raise ValueError(f"BOP targets must contain a list: {path}")
+    matches = [
+        item
+        for item in targets
+        if isinstance(item, dict)
+        and int(item.get("scene_id", -1)) == int(scene_id)
+        and int(item.get("im_id", -1)) == int(im_id)
+        and int(item.get("obj_id", -1)) == int(obj_id)
+    ]
+    if not matches:
+        raise KeyError(
+            "no BOP localization target for "
+            f"scene={scene_id}, im={im_id}, obj={obj_id} in {path}"
+        )
+    if len(matches) != 1:
+        raise ValueError(
+            "expected one BOP localization target for "
+            f"scene={scene_id}, im={im_id}, obj={obj_id}; got {len(matches)}"
+        )
+    if "inst_count" not in matches[0]:
+        raise KeyError(f"inst_count missing from localization target in {path}")
+    count = int(matches[0]["inst_count"])
+    if count < 0:
+        raise ValueError("inst_count must be non-negative")
+    return count
+
+
+def _translation_nms(
+    candidates: list[dict],
+    *,
+    threshold_mm: float,
+    max_count: int,
+) -> tuple[list[int], dict[int, int | None]]:
+    threshold_mm = float(threshold_mm)
+    max_count = int(max_count)
+    if not np.isfinite(threshold_mm) or threshold_mm <= 0.0:
+        raise ValueError("translation NMS threshold must be positive and finite")
+    if max_count < 0:
+        raise ValueError("max_count must be non-negative")
+
+    translations = []
+    scores = []
+    for index, candidate in enumerate(candidates):
+        score = float(candidate["final_score"])
+        translation = np.asarray(candidate["t_mm"], dtype=np.float64).reshape(-1)
+        if translation.shape != (3,) or not np.isfinite(translation).all():
+            raise ValueError(f"candidate {index} has invalid t_mm")
+        if not np.isfinite(score):
+            raise ValueError(f"candidate {index} has non-finite final_score")
+        translations.append(translation)
+        scores.append(score)
+
+    order = sorted(range(len(candidates)), key=lambda idx: (-scores[idx], idx))
+    selected: list[int] = []
+    suppressed_by: dict[int, int | None] = {}
+    for index in order:
+        suppressor = next(
+            (
+                selected_index
+                for selected_index in selected
+                if np.linalg.norm(
+                    translations[index] - translations[selected_index]
+                ) < threshold_mm
+            ),
+            None,
+        )
+        if suppressor is not None:
+            suppressed_by[index] = suppressor
+            continue
+        if len(selected) >= max_count:
+            suppressed_by[index] = -1
+            continue
+        selected.append(index)
+        suppressed_by[index] = None
+    return selected, suppressed_by
+
+
+def _invoke_main_command(argv: list[str]) -> dict:
+    original_argv = sys.argv
+    stdout = io.StringIO()
+    try:
+        sys.argv = ["run_bop.py", *map(str, argv)]
+        with contextlib.redirect_stdout(stdout):
+            main()
+    finally:
+        sys.argv = original_argv
+    payload = stdout.getvalue().strip()
+    if not payload:
+        return {}
+    result = json.loads(payload)
+    if not isinstance(result, dict):
+        raise RuntimeError("nested run_bop command did not return a JSON object")
+    return result
+
+
+def _download_default_masks(dataset: str, output_dir: Path, *, force: bool) -> dict:
+    output_dir = Path(output_dir)
+    output = output_dir / f"cnos-fastsam_{dataset}-test.json"
+    if output.is_file() and not force:
+        try:
+            existing = json.loads(output.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, list):
+            return {
+                "dataset": dataset,
+                "url": DEFAULT_MASK_ARCHIVE_URL,
+                "output": str(output),
+                "skipped": True,
+            }
+
+    with urllib.request.urlopen(DEFAULT_MASK_ARCHIVE_URL) as response:
+        archive_bytes = response.read()
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        expected = {
+            f"cnos-fastsam_{dataset}_test.json",
+            f"cnos-fastsam_{dataset}-test.json",
+        }
+        members = [
+            name
+            for name in archive.namelist()
+            if Path(name).name in expected
+        ]
+        if len(members) != 1:
+            raise FileNotFoundError(
+                f"expected exactly one {sorted(expected)} member in BOP archive; "
+                f"found {members}"
+            )
+        payload = archive.read(members[0])
+    decoded = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded, list):
+        raise ValueError("downloaded detection JSON must contain a list")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(decoded))
+    return {
+        "dataset": dataset,
+        "url": DEFAULT_MASK_ARCHIVE_URL,
+        "archive_member": members[0],
+        "output": str(output),
+        "skipped": False,
+    }
+
+
+def _estimate_multi_mask(args) -> dict:
+    if args.scene_id < 0 or args.im_id < 0:
+        raise ValueError("--scene-id and --im-id must be non-negative")
+    if args.obj_id <= 0:
+        raise ValueError("--obj-id must be positive")
+    if args.nms_translation_threshold_mm <= 0 or not np.isfinite(
+        args.nms_translation_threshold_mm
+    ):
+        raise ValueError(
+            "--nms-translation-threshold-mm must be positive and finite"
+        )
+
+    targets_json = args.targets_json or (
+        args.bop_root / args.dataset / "test_targets_bop19.json"
+    )
+    instance_count = _load_localization_instance_count(
+        targets_json,
+        scene_id=args.scene_id,
+        im_id=args.im_id,
+        obj_id=args.obj_id,
+    )
+    candidate_limit = instance_count + 1
+    detection_paths = list(args.detection_json or [])
+    if not detection_paths:
+        detection_paths = [
+            Path("data/detections/cnos-fastsam")
+            / f"cnos-fastsam_{args.dataset}-test.json"
+        ]
+
+    queued_candidates = []
+    for source_order, source_path in enumerate(detection_paths):
+        source_candidates = _load_detection_candidates(
+            source_path,
+            scene_id=args.scene_id,
+            im_id=args.im_id,
+            obj_id=args.obj_id,
+            limit=candidate_limit,
+        )
+        for candidate in source_candidates:
+            queued_candidates.append({
+                **candidate,
+                "source_order": source_order,
+            })
+
+    work_dir = args.work_dir or (
+        Path("outputs/multi_mask")
+        / (
+            f"{args.dataset}_scene_{args.scene_id:06d}_"
+            f"im_{args.im_id:06d}_obj_{args.obj_id:06d}"
+        )
+    )
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Install Pillow to materialize candidate masks") from exc
+
+    candidates = []
+    for candidate_index, candidate in enumerate(queued_candidates):
+        prefix = work_dir / f"candidate_{candidate_index:03d}"
+        mask_path = prefix.with_name(prefix.name + "_mask.png")
+        target_path = prefix.with_name(prefix.name + "_target.npz")
+        coarse_path = prefix.with_name(prefix.name + "_coarse.npz")
+        fine_path = prefix.with_name(prefix.name + "_fine.npz")
+        record = {
+            "candidate_index": candidate_index,
+            "source_order": candidate["source_order"],
+            "source_name": candidate["source_name"],
+            "source_path": candidate["source_path"],
+            "source_detection_index": candidate["source_detection_index"],
+            "segmentation_confidence": candidate[
+                "segmentation_confidence"
+            ],
+            "mask_path": str(mask_path),
+            "target_cache_path": str(target_path),
+            "coarse_cache_path": str(coarse_path),
+            "fine_cache_path": str(fine_path),
+        }
+        try:
+            mask = _decode_uncompressed_coco_rle(candidate["segmentation"])
+            Image.fromarray(mask.astype(np.uint8) * 255).save(mask_path)
+
+            target_argv = [
+                "extract-target",
+                "--dataset", args.dataset,
+                "--scene-id", str(args.scene_id),
+                "--im-id", str(args.im_id),
+                "--obj-id", str(args.obj_id),
+                "--mask", str(mask_path),
+                "--bop-root", str(args.bop_root),
+                "--split", args.split,
+                "--dinov2-root", str(args.dinov2_root),
+                "--gedi-root", str(args.gedi_root),
+                "--checkpoint", str(args.checkpoint),
+                "--device", args.device,
+                "--grid-size", str(args.grid_size),
+                "--dense-size", str(args.dense_size),
+                "--seed", str(args.seed),
+                "--output", str(target_path),
+            ]
+            if args.query_cache is not None:
+                target_argv += ["--query-cache", str(args.query_cache)]
+            _invoke_main_command(target_argv)
+
+            coarse_argv = [
+                "estimate-coarse-pose",
+                "--dataset", args.dataset,
+                "--scene-id", str(args.scene_id),
+                "--im-id", str(args.im_id),
+                "--obj-id", str(args.obj_id),
+                "--target-cache", str(target_path),
+                "--bop-root", str(args.bop_root),
+                "--split", args.split,
+                "--top-k", str(args.top_k),
+                "--iterations", str(args.iterations),
+                "--seed", str(args.seed),
+                "--edge-similarity-threshold",
+                str(args.edge_similarity_threshold),
+                "--output", str(coarse_path),
+            ]
+            if args.query_cache is not None:
+                coarse_argv += ["--query-cache", str(args.query_cache)]
+            coarse_report = _invoke_main_command(coarse_argv)
+
+            refine_argv = [
+                "refine-pose",
+                "--dataset", args.dataset,
+                "--scene-id", str(args.scene_id),
+                "--im-id", str(args.im_id),
+                "--obj-id", str(args.obj_id),
+                "--target-cache", str(target_path),
+                "--coarse-cache", str(coarse_path),
+                "--bop-root", str(args.bop_root),
+                "--split", args.split,
+                "--icp-max-iterations", str(args.icp_max_iterations),
+                "--output", str(fine_path),
+            ]
+            if args.query_cache is not None:
+                refine_argv += ["--query-cache", str(args.query_cache)]
+            fine_report = _invoke_main_command(refine_argv)
+
+            record.update({
+                "status": "valid",
+                "coarse_score": float(coarse_report["coarse_score"]),
+                "fine_feature_score": float(
+                    fine_report["fine_feature_score"]
+                ),
+                "icp_score": float(fine_report["icp_score"]),
+                "final_score": float(fine_report["final_score"]),
+                "R": fine_report["R"],
+                "t_mm": fine_report["t_mm"],
+            })
+        except Exception as exc:
+            record.update({
+                "status": "invalid",
+                "error": f"{type(exc).__name__}: {exc}",
+                "nms_selected": False,
+                "nms_status": "invalid",
+            })
+        candidates.append(record)
+
+    valid_candidates = [
+        candidate for candidate in candidates if candidate["status"] == "valid"
+    ]
+    selected_indices, suppressed_by = _translation_nms(
+        valid_candidates,
+        threshold_mm=args.nms_translation_threshold_mm,
+        max_count=instance_count,
+    )
+    selected_set = set(selected_indices)
+    for valid_index, candidate in enumerate(valid_candidates):
+        suppressor = suppressed_by[valid_index]
+        if valid_index in selected_set:
+            candidate["nms_selected"] = True
+            candidate["nms_status"] = "selected"
+            candidate["suppressed_by_candidate_index"] = None
+        elif suppressor == -1:
+            candidate["nms_selected"] = False
+            candidate["nms_status"] = "rank_limit"
+            candidate["suppressed_by_candidate_index"] = None
+        else:
+            candidate["nms_selected"] = False
+            candidate["nms_status"] = "suppressed"
+            candidate["suppressed_by_candidate_index"] = valid_candidates[
+                suppressor
+            ]["candidate_index"]
+
+    selected = [
+        {
+            "candidate_index": valid_candidates[index]["candidate_index"],
+            "source_name": valid_candidates[index]["source_name"],
+            "source_path": valid_candidates[index]["source_path"],
+            "source_detection_index": valid_candidates[index][
+                "source_detection_index"
+            ],
+            "segmentation_confidence": valid_candidates[index][
+                "segmentation_confidence"
+            ],
+            "final_score": valid_candidates[index]["final_score"],
+            "R": valid_candidates[index]["R"],
+            "t_mm": valid_candidates[index]["t_mm"],
+        }
+        for index in selected_indices
+    ]
+
+    output = args.output or (work_dir / "result.json")
+    output = Path(output)
+    report = {
+        "dataset": args.dataset,
+        "scene_id": args.scene_id,
+        "im_id": args.im_id,
+        "obj_id": args.obj_id,
+        "targets_json": str(targets_json),
+        "instance_count": instance_count,
+        "candidate_policy": "top N+1 per source",
+        "candidate_limit_per_source": candidate_limit,
+        "detection_sources": [str(path) for path in detection_paths],
+        "nms_translation_threshold_mm": float(
+            args.nms_translation_threshold_mm
+        ),
+        "candidate_count": len(candidates),
+        "valid_candidate_count": len(valid_candidates),
+        "selected_count": len(selected),
+        "candidates": candidates,
+        "selected": selected,
+        "work_dir": str(work_dir),
+        "output": str(output),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, sort_keys=True))
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FreeZeV2 BOP reproduction utilities")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -108,6 +609,19 @@ def main() -> None:
     download = subparsers.add_parser("download-reference", help="Download the authors' public FreeZeV2.1 result CSV")
     download.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
     download.add_argument("--output-dir", type=Path, default=Path("data/reference"))
+    default_masks = subparsers.add_parser(
+        "download-default-masks",
+        help="Download BOP 2023 Task-4 default CNOS/FastSAM detections",
+    )
+    default_masks.add_argument(
+        "--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS)
+    )
+    default_masks.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/detections/cnos-fastsam"),
+    )
+    default_masks.add_argument("--force", action="store_true")
 
     evaluate = subparsers.add_parser("evaluate-reference", help="Run the official BOP19 pose evaluator")
     evaluate.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
@@ -258,6 +772,48 @@ def main() -> None:
     refine.add_argument("--gt-id", type=int)
     refine.add_argument("--output", type=Path)
 
+    multi = subparsers.add_parser(
+        "estimate-multi-mask",
+        help="Estimate and rank poses from downloaded candidate masks",
+    )
+    multi.add_argument(
+        "--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS)
+    )
+    multi.add_argument("--scene-id", type=int, required=True)
+    multi.add_argument("--im-id", type=int, required=True)
+    multi.add_argument("--obj-id", type=int, required=True)
+    multi.add_argument("--bop-root", type=Path, default=Path("data/bop"))
+    multi.add_argument("--split", default="test")
+    multi.add_argument("--query-cache", type=Path)
+    multi.add_argument("--detection-json", type=Path, action="append")
+    multi.add_argument("--targets-json", type=Path)
+    multi.add_argument(
+        "--nms-translation-threshold-mm", type=float, required=True
+    )
+    multi.add_argument(
+        "--dinov2-root", type=Path, default=Path("external/dinov2")
+    )
+    multi.add_argument(
+        "--gedi-root", type=Path, default=Path("external/gedi")
+    )
+    multi.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("external/gedi/data/chkpts/3dmatch/chkpt.tar"),
+    )
+    multi.add_argument("--device", default="cuda")
+    multi.add_argument("--grid-size", type=int, default=16)
+    multi.add_argument("--dense-size", type=int, default=3000)
+    multi.add_argument("--top-k", type=int, default=10)
+    multi.add_argument("--iterations", type=int, default=10_000)
+    multi.add_argument("--seed", type=int, default=0)
+    multi.add_argument(
+        "--edge-similarity-threshold", type=float, default=0.9
+    )
+    multi.add_argument("--icp-max-iterations", type=int, default=30)
+    multi.add_argument("--work-dir", type=Path)
+    multi.add_argument("--output", type=Path)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -266,6 +822,20 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "download-default-masks":
+        report = _download_default_masks(
+            args.dataset,
+            args.output_dir,
+            force=args.force,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    if args.command == "estimate-multi-mask":
+        report = _estimate_multi_mask(args)
+        print(json.dumps(report, indent=2, sort_keys=True))
         return
 
     if args.command == "extract-target":
@@ -448,6 +1018,12 @@ def main() -> None:
             "coarse_score": np.float64(coarse_score),
             "candidate_query_indices": np.asarray(candidate_idx, dtype=np.int64),
             "candidate_similarities": np.asarray(candidate_sim, dtype=np.float64),
+            "top1_similarity_mean": np.float64(
+                np.asarray(candidate_sim[:, 0], dtype=np.float64).mean()
+            ),
+            "kth_similarity_mean": np.float64(
+                np.asarray(candidate_sim[:, -1], dtype=np.float64).mean()
+            ),
             "diameter": np.float32(diameter),
             "inlier_threshold": np.float32(inlier_threshold),
             "edge_similarity_threshold": np.float32(
