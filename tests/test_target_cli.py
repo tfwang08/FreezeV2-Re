@@ -86,7 +86,7 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         diameter=np.float32(100.0),
         dino_layer=np.int32(30),
         dino_facet=np.array("token"),
-        dino_model=np.array("dinov2_vitg14"),
+        dino_model=np.array("dinov2_vitg14_reg"),
     )
 
     dinov2_root = tmp_path / "dinov2"
@@ -164,7 +164,7 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         "cuda",
         30,
         "token",
-        "dinov2_vitg14",
+        "dinov2_vitg14_reg",
         dinov2_root,
     )
     assert calls["rgb_shape"] == (224, 224, 3)
