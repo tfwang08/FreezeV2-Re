@@ -157,9 +157,10 @@ def extract_target_cache(args, *, dino_cls, gedi_cls) -> dict:
     if len(sparse_pixels) > TARGET_DINO_PATCH_GRID**2:
         raise RuntimeError("sparse grid returned more than 16x16 points")
 
-    # Backproject the original-image patch centers. Raster/window centers use
-    # integer cell boundaries, hence -0.5 converts to OpenCV pixel-center coords.
-    opencv_xy = sparse_image_xy.astype(np.float64) - 0.5
+    # FoundPose uses the patch-center coordinates directly for both DINO
+    # sampling and camera lifting; BOP cam_K is consumed without a half-pixel
+    # offset. Keep the target 2D/3D coordinate convention identical here.
+    opencv_xy = sparse_image_xy.astype(np.float64)
     u = opencv_xy[:, 0]
     v = opencv_xy[:, 1]
     z = depth_mm[sparse_pixels[:, 1], sparse_pixels[:, 0]].astype(np.float64)
