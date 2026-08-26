@@ -11,16 +11,21 @@ on:
       - "freezev2/gedi_bridge.py"
       - "freezev2/gedi_radius.py"
       - "freezev2/gpu_stack.py"
+      - "freezev2/matching.py"
+      - "freezev2/pose.py"
+      - "freezev2/pipeline.py"
       - "scripts/setup_gedi.sh"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
+      - "tests/test_core.py"
       - "tests/test_onboard.py"
       - "tests/test_gedi_bridge.py"
       - "tests/test_gedi_radius.py"
       - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
       - "tests/test_target_cli.py"
+      - "tests/test_pose_cli.py"
   pull_request:
     branches: [main]
     paths:
@@ -31,16 +36,21 @@ on:
       - "freezev2/gedi_bridge.py"
       - "freezev2/gedi_radius.py"
       - "freezev2/gpu_stack.py"
+      - "freezev2/matching.py"
+      - "freezev2/pose.py"
+      - "freezev2/pipeline.py"
       - "scripts/setup_gedi.sh"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
+      - "tests/test_core.py"
       - "tests/test_onboard.py"
       - "tests/test_gedi_bridge.py"
       - "tests/test_gedi_radius.py"
       - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
       - "tests/test_target_cli.py"
+      - "tests/test_pose_cli.py"
   workflow_dispatch:
 
 jobs:
