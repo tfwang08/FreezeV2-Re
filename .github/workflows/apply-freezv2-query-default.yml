@@ -1,0 +1,65 @@
+name: Apply FreeZeV2 query default patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-freezv2-query-default.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch FreeZeV2 query default
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("run_bop.py")
+          text = path.read_text()
+
+          crop_import = '''from freezev2.query_crop import (\n    QUERY_DINO_INPUT_SIZE,\n    QUERY_DINO_MODE,\n    QUERY_DINO_PATCH_GRID,\n)\n'''
+          if text.count(crop_import) != 1:
+              raise SystemExit(f"query_crop import count={text.count(crop_import)}")
+          text = text.replace(crop_import, "", 1)
+
+          old_import = '''from freezev2.query_features import (\n    aggregate_query_visual_features_pixel_lifting_streaming,\n    aggregate_query_visual_features_streaming,\n)\n'''
+          new_import = 'from freezev2.query_features import aggregate_query_visual_features_streaming\n'
+          if text.count(old_import) != 1:
+              raise SystemExit(f"query_features import count={text.count(old_import)}")
+          text = text.replace(old_import, new_import, 1)
+
+          start_marker = '''        (\n            kept_points,\n            visual_view_uniform,\n            visual_pixel_support,\n            view_counts,\n            pixel_support_counts,\n        ) = aggregate_query_visual_features_pixel_lifting_streaming(\n'''
+          end_marker = '''        return\n\n    if args.command == "extract-query-gedi":\n'''
+          start = text.find(start_marker)
+          end = text.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit(f"extract query block markers missing: start={start}, end={end}")
+
+          new_block = '''        kept_points, visual_features, view_counts = (\n            aggregate_query_visual_features_streaming(\n                query_points,\n                templates,\n                extractor,\n                depth_tolerance=args.depth_tolerance,\n                min_views=args.min_views,\n                view_weights=None,\n                depth_sampling=args.depth_sampling,\n            )\n        )\n        kept_points = np.asarray(kept_points, dtype=np.float32)\n        visual_features = np.asarray(visual_features, dtype=np.float32)\n        view_counts = np.asarray(view_counts, dtype=np.int32)\n\n        if kept_points.ndim != 2 or kept_points.shape[1] != 3:\n            raise RuntimeError(f"unexpected visual query-point shape: {kept_points.shape}")\n        if visual_features.ndim != 2 or len(visual_features) != len(kept_points):\n            raise RuntimeError(\n                f"unexpected query visual-feature shape: {visual_features.shape}"\n            )\n        if view_counts.shape != (len(kept_points),):\n            raise RuntimeError(f"unexpected view-count shape: {view_counts.shape}")\n        if not np.isfinite(visual_features).all():\n            raise RuntimeError("query visual features contain non-finite values")\n\n        output.parent.mkdir(parents=True, exist_ok=True)\n        np.savez_compressed(\n            output,\n            query_points=kept_points,\n            visual_features=visual_features,\n            view_counts=view_counts,\n            visual_aggregation=np.array("freezv2_3d_to_2d_visible_view_uniform"),\n            query_sampling_mode=np.array("3d_to_2d_projection"),\n            query_visibility=np.array("rendered_depth"),\n            dino_layer=np.int32(args.layer),\n            dino_facet=np.array(args.facet),\n            dino_model=np.array(DINOV2_MODEL_NAME),\n            dino_commit=np.array(DINOV2_FOUNDPOSE_COMMIT),\n            device=np.array(args.device),\n            min_views=np.int32(args.min_views),\n            depth_tolerance=np.float32(args.depth_tolerance),\n            depth_sampling=np.array(args.depth_sampling),\n            num_templates=np.int32(len(templates)),\n            input_query_count=np.int32(len(query_points)),\n            onboarding_source=np.array(str(cache_path)),\n            rgb_source=np.array(str(rgb_dir)),\n        )\n        print(json.dumps({\n            "dataset": args.dataset,\n            "obj_id": args.obj_id,\n            "dino_layer": args.layer,\n            "dino_model": DINOV2_MODEL_NAME,\n            "input_query_points": list(query_points.shape),\n            "retained_query_points": list(kept_points.shape),\n            "visual_features": list(visual_features.shape),\n            "view_count_range": [\n                int(view_counts.min()) if len(view_counts) else 0,\n                int(view_counts.max()) if len(view_counts) else 0,\n            ],\n            "visual_aggregation": "freezv2_3d_to_2d_visible_view_uniform",\n            "query_sampling_mode": "3d_to_2d_projection",\n            "query_visibility": "rendered_depth",\n            "min_views": args.min_views,\n            "depth_tolerance": args.depth_tolerance,\n            "depth_sampling": args.depth_sampling,\n            "finite": bool(np.isfinite(visual_features).all()),\n            "output": str(output),\n        }, indent=2, sort_keys=True))\n'''
+          text = text[:start] + new_block + text[end:]
+
+          old_metadata = '''                "visual_aggregation",\n                "visual_weighting_candidate",\n                "query_dino_mode",\n'''
+          new_metadata = '''                "visual_aggregation",\n                "query_sampling_mode",\n                "query_visibility",\n                "visual_weighting_candidate",\n                "query_dino_mode",\n'''
+          if text.count(old_metadata) != 1:
+              raise SystemExit(f"fusion metadata anchor count={text.count(old_metadata)}")
+          text = text.replace(old_metadata, new_metadata, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add run_bop.py
+          git diff --cached --check
+          git commit -m "fix: use FreeZeV2 3D-to-2D query aggregation by default"
+          git push
