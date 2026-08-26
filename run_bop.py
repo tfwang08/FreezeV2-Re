@@ -13,6 +13,7 @@ from freezev2.bop import (
     evaluate_reference,
     prepare_bop_dataset,
 )
+from freezev2.fusion import fit_visual_pca, fuse_visual_geometric
 from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
 
 
@@ -53,6 +54,20 @@ def main() -> None:
     )
     gedi.add_argument("--output", type=Path)
     gedi.add_argument("--seed", type=int, default=0)
+
+    fuse = subparsers.add_parser(
+        "fuse-query-features",
+        help="Fit query-only visual PCA and fuse DINO/GeDi descriptors",
+    )
+    fuse.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    fuse.add_argument("--obj-id", type=int, required=True)
+    fuse.add_argument("--visual", type=Path)
+    fuse.add_argument("--geometric", type=Path)
+    fuse.add_argument("--output", type=Path)
+    fuse.add_argument("--visual-key", default="visual_features")
+    fuse.add_argument("--geometric-key", default="geometric_features")
+    fuse.add_argument("--points-key", default="query_points")
+    fuse.add_argument("--pca-dim", type=int, default=64)
 
     args = parser.parse_args()
 
@@ -133,6 +148,126 @@ def main() -> None:
             "geometric_features": list(geometric.shape),
             "radii": radii.tolist(),
             "finite": bool(np.isfinite(geometric).all()),
+            "output": str(output),
+        }, indent=2, sort_keys=True))
+        return
+
+    if args.command == "fuse-query-features":
+        if args.obj_id <= 0:
+            raise ValueError("--obj-id must be positive")
+        if args.pca_dim <= 0:
+            raise ValueError("--pca-dim must be positive")
+
+        stem = f"{args.dataset}_obj_{args.obj_id:06d}"
+        visual_path = args.visual or (
+            Path("outputs/features") / f"{stem}_visual.npz"
+        )
+        geometric_path = args.geometric or (
+            Path("outputs/features") / f"{stem}_gedi.npz"
+        )
+        output = args.output or (
+            Path("outputs/features") / f"{stem}_query.npz"
+        )
+
+        visual_metadata = {}
+        with np.load(visual_path, allow_pickle=False) as data:
+            if args.points_key not in data:
+                raise KeyError(f"{args.points_key} missing from {visual_path}")
+            if args.visual_key not in data:
+                raise KeyError(f"{args.visual_key} missing from {visual_path}")
+            points_visual = np.asarray(data[args.points_key], dtype=np.float32)
+            visual = np.asarray(data[args.visual_key], dtype=np.float32)
+            for key in (
+                "view_counts",
+                "dino_layer",
+                "dino_facet",
+                "dino_model",
+                "dino_commit",
+                "min_views",
+                "depth_tolerance",
+                "depth_sampling",
+            ):
+                if key in data:
+                    visual_metadata[key] = np.array(data[key], copy=True)
+
+        geometric_metadata = {}
+        with np.load(geometric_path, allow_pickle=False) as data:
+            if args.points_key not in data:
+                raise KeyError(f"{args.points_key} missing from {geometric_path}")
+            if args.geometric_key not in data:
+                raise KeyError(f"{args.geometric_key} missing from {geometric_path}")
+            points_geometric = np.asarray(data[args.points_key], dtype=np.float32)
+            geometric = np.asarray(data[args.geometric_key], dtype=np.float32)
+            for key in ("diameter", "scales", "radii", "seed", "gedi_commit"):
+                if key in data:
+                    geometric_metadata[key] = np.array(data[key], copy=True)
+
+        if points_visual.ndim != 2 or points_visual.shape[1] != 3:
+            raise ValueError("visual query_points must have shape Nx3")
+        if points_geometric.ndim != 2 or points_geometric.shape[1] != 3:
+            raise ValueError("geometric query_points must have shape Nx3")
+        if points_visual.shape != points_geometric.shape or not np.allclose(
+            points_visual,
+            points_geometric,
+            atol=1e-5,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                "visual and geometric caches do not describe the same points"
+            )
+        if visual.ndim != 2 or geometric.ndim != 2:
+            raise ValueError("visual and geometric features must have shape NxD")
+        if len(visual) != len(points_visual) or len(geometric) != len(points_visual):
+            raise ValueError("feature caches and query points have inconsistent lengths")
+        if args.pca_dim != geometric.shape[1]:
+            raise ValueError(
+                "--pca-dim must equal the geometric feature dimension "
+                f"({geometric.shape[1]})"
+            )
+
+        pca = fit_visual_pca(visual, output_dim=args.pca_dim)
+        fused = fuse_visual_geometric(visual, geometric, pca)
+        expected_shape = (len(points_visual), args.pca_dim + geometric.shape[1])
+        if fused.shape != expected_shape:
+            raise RuntimeError(f"unexpected fused query shape: {fused.shape}")
+        if not np.isfinite(fused).all():
+            raise RuntimeError("fused query features contain non-finite values")
+
+        visual_norms = np.linalg.norm(fused[:, : args.pca_dim], axis=1)
+        geometric_norms = np.linalg.norm(fused[:, args.pca_dim :], axis=1)
+        payload = {
+            "query_points": points_visual,
+            "fused_features": fused,
+            "pca_mean": pca.mean.astype(np.float32),
+            "pca_components": pca.components.astype(np.float32),
+            "visual_dim": np.int32(visual.shape[1]),
+            "geometric_dim": np.int32(geometric.shape[1]),
+            "pca_dim": np.int32(args.pca_dim),
+            "visual_source": np.array(str(visual_path)),
+            "geometric_source": np.array(str(geometric_path)),
+        }
+        payload.update(visual_metadata)
+        payload.update(geometric_metadata)
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(output, **payload)
+        print(json.dumps({
+            "dataset": args.dataset,
+            "obj_id": args.obj_id,
+            "query_points": list(points_visual.shape),
+            "visual_features": list(visual.shape),
+            "geometric_features": list(geometric.shape),
+            "pca_components": list(pca.components.shape),
+            "fused_features": list(fused.shape),
+            "visual_branch_norm_range": [
+                float(visual_norms.min()),
+                float(visual_norms.max()),
+            ],
+            "geometric_branch_norm_range": [
+                float(geometric_norms.min()),
+                float(geometric_norms.max()),
+            ],
+            "finite": bool(np.isfinite(fused).all()),
             "output": str(output),
         }, indent=2, sort_keys=True))
         return
