@@ -20,6 +20,7 @@ on:
       - "tests/test_gedi_radius.py"
       - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
+      - "tests/test_target_cli.py"
   pull_request:
     branches: [main]
     paths:
@@ -39,6 +40,7 @@ on:
       - "tests/test_gedi_radius.py"
       - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
+      - "tests/test_target_cli.py"
   workflow_dispatch:
 
 jobs:
