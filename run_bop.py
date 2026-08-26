@@ -54,8 +54,6 @@ def _sample_mask_patch_centers(
             np.empty((0, 2), dtype=np.int64),
         )
 
-    # Treat integer array indices as pixel-cell lower boundaries. The mask bbox
-    # therefore spans [min_index, max_index + 1] in raster coordinates.
     x0 = float(xs.min())
     x1 = float(xs.max() + 1)
     y0 = float(ys.min())
@@ -217,6 +215,11 @@ def main() -> None:
     coarse.add_argument("--top-k", type=int, default=10)
     coarse.add_argument("--iterations", type=int, default=10_000)
     coarse.add_argument("--seed", type=int, default=0)
+    coarse.add_argument(
+        "--edge-tolerance",
+        type=float,
+        help="Triplet edge-length tolerance in 3D units; defaults to 0.03*diameter",
+    )
     coarse.add_argument("--gt-id", type=int)
     coarse.add_argument("--output", type=Path)
 
@@ -239,6 +242,8 @@ def main() -> None:
             raise ValueError("--top-k must be positive")
         if args.iterations <= 0:
             raise ValueError("--iterations must be positive")
+        if args.edge_tolerance is not None and args.edge_tolerance <= 0:
+            raise ValueError("--edge-tolerance must be positive")
         if args.gt_id is not None and args.gt_id < 0:
             raise ValueError("--gt-id must be non-negative")
 
@@ -302,12 +307,18 @@ def main() -> None:
             if not np.isfinite(array).all():
                 raise ValueError(f"{name} contains non-finite values")
 
+        inlier_threshold = 0.03 * diameter
+        edge_tolerance = (
+            inlier_threshold
+            if args.edge_tolerance is None
+            else float(args.edge_tolerance)
+        )
         candidate_idx, candidate_sim = topk_cosine_matches(
             target_features,
             query_features,
             k=args.top_k,
         )
-        coarse_pose, coarse_score = estimate_pose_from_features(
+        coarse_pose, coarse_score, ransac_debug = estimate_pose_from_features(
             query_points,
             query_features,
             target_points,
@@ -316,12 +327,15 @@ def main() -> None:
             k=args.top_k,
             iterations=args.iterations,
             seed=args.seed,
+            edge_tolerance=edge_tolerance,
+            return_debug=True,
         )
         coarse_pose = np.asarray(coarse_pose, dtype=np.float64)
         if coarse_pose.shape != (4, 4) or not np.isfinite(coarse_pose).all():
             raise RuntimeError("coarse pose must be a finite 4x4 matrix")
+        if not np.isfinite(coarse_score):
+            raise RuntimeError("RANSAC did not produce a finite coarse score")
 
-        inlier_threshold = 0.03 * diameter
         R_pred = coarse_pose[:3, :3]
         t_pred = coarse_pose[:3, 3]
         rotation_det = float(np.linalg.det(R_pred))
@@ -379,9 +393,24 @@ def main() -> None:
             "candidate_similarities": np.asarray(candidate_sim, dtype=np.float64),
             "diameter": np.float32(diameter),
             "inlier_threshold": np.float32(inlier_threshold),
+            "edge_tolerance": np.float32(ransac_debug["edge_tolerance"]),
             "top_k": np.int32(args.top_k),
             "iterations": np.int32(args.iterations),
             "seed": np.int32(args.seed),
+            "winning_target_indices": np.asarray(
+                ransac_debug["winning_target_indices"], dtype=np.int64
+            ),
+            "winning_candidate_columns": np.asarray(
+                ransac_debug["winning_candidate_columns"], dtype=np.int64
+            ),
+            "winning_query_indices": np.asarray(
+                ransac_debug["winning_query_indices"], dtype=np.int64
+            ),
+            "inlier_count": np.int32(ransac_debug["inlier_count"]),
+            "inlier_target_count": np.int32(ransac_debug["inlier_target_count"]),
+            "degenerate_triplets": np.int32(ransac_debug["degenerate_triplets"]),
+            "edge_pruned_triplets": np.int32(ransac_debug["edge_pruned_triplets"]),
+            "valid_hypotheses": np.int32(ransac_debug["valid_hypotheses"]),
             "scene_id": np.int32(args.scene_id),
             "im_id": np.int32(args.im_id),
             "obj_id": np.int32(args.obj_id),
@@ -412,10 +441,16 @@ def main() -> None:
             "top_k": args.top_k,
             "iterations": args.iterations,
             "inlier_threshold": float(inlier_threshold),
+            "edge_tolerance": float(ransac_debug["edge_tolerance"]),
             "top1_similarity_range": [float(top1.min()), float(top1.max())],
             "top1_similarity_mean": float(top1.mean()),
             "kth_similarity_mean": float(kth.mean()),
             "coarse_score": float(coarse_score),
+            "inlier_count": int(ransac_debug["inlier_count"]),
+            "inlier_target_count": int(ransac_debug["inlier_target_count"]),
+            "degenerate_triplets": int(ransac_debug["degenerate_triplets"]),
+            "edge_pruned_triplets": int(ransac_debug["edge_pruned_triplets"]),
+            "valid_hypotheses": int(ransac_debug["valid_hypotheses"]),
             "rotation_determinant": rotation_det,
             "rotation_orthogonality_error": rotation_orthogonality_error,
             "R": R_pred.tolist(),
@@ -677,10 +712,6 @@ def main() -> None:
         if len(sparse_pixels) > args.grid_size * args.grid_size:
             raise RuntimeError("sparse grid returned more than grid_size^2 points")
 
-        # BOP/OpenCV K uses integer pixel-center coordinates, while the DINO
-        # sampling convention uses raster/window coordinates with pixel centers
-        # at half-integers. Convert the continuous patch centers back by 0.5 for
-        # 3D backprojection, but keep the original centers for DINO sampling.
         opencv_xy = sparse_image_xy.astype(np.float64) - 0.5
         u = opencv_xy[:, 0]
         v = opencv_xy[:, 1]
