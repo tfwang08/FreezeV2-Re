@@ -17,10 +17,13 @@ from freezev2.features import (
     DINOV2_FOUNDPOSE_COMMIT,
     DINOV2_MODEL_NAME,
     DinoExtractor,
+    sample_feature_map,
 )
-from freezev2.fusion import fit_visual_pca, fuse_visual_geometric
+from freezev2.fusion import VisualPCA, fit_visual_pca, fuse_visual_geometric
 from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
+from freezev2.geometry import backproject_depth
 from freezev2.onboard import load_onboarding_templates
+from freezev2.pose import sparse_grid_pixels
 from freezev2.query_features import aggregate_query_visual_features_streaming
 
 
@@ -97,6 +100,31 @@ def main() -> None:
     fuse.add_argument("--points-key", default="query_points")
     fuse.add_argument("--pca-dim", type=int, default=64)
 
+    target = subparsers.add_parser(
+        "extract-target",
+        help="Build one sparse RGB-D target representation from an external mask",
+    )
+    target.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    target.add_argument("--scene-id", type=int, required=True)
+    target.add_argument("--im-id", type=int, required=True)
+    target.add_argument("--obj-id", type=int, required=True)
+    target.add_argument("--mask", type=Path, required=True)
+    target.add_argument("--bop-root", type=Path, default=Path("data/bop"))
+    target.add_argument("--split", default="test")
+    target.add_argument("--query-cache", type=Path)
+    target.add_argument("--dinov2-root", type=Path, default=Path("external/dinov2"))
+    target.add_argument("--gedi-root", type=Path, default=Path("external/gedi"))
+    target.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("external/gedi/data/chkpts/3dmatch/chkpt.tar"),
+    )
+    target.add_argument("--device", default="cuda")
+    target.add_argument("--grid-size", type=int, default=16)
+    target.add_argument("--dense-size", type=int, default=3000)
+    target.add_argument("--seed", type=int, default=0)
+    target.add_argument("--output", type=Path)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -105,6 +133,267 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "extract-target":
+        if args.scene_id < 0 or args.im_id < 0:
+            raise ValueError("--scene-id and --im-id must be non-negative")
+        if args.obj_id <= 0:
+            raise ValueError("--obj-id must be positive")
+        if args.grid_size <= 0:
+            raise ValueError("--grid-size must be positive")
+        if args.dense_size <= 0:
+            raise ValueError("--dense-size must be positive")
+
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError("Install Pillow to load BOP RGB-D inputs") from exc
+
+        stem = f"{args.dataset}_obj_{args.obj_id:06d}"
+        query_cache = args.query_cache or (
+            Path("outputs/features") / f"{stem}_query.npz"
+        )
+        scene_dir = (
+            args.bop_root
+            / args.dataset
+            / args.split
+            / f"{args.scene_id:06d}"
+        )
+        rgb_path = scene_dir / "rgb" / f"{args.im_id:06d}.png"
+        depth_path = scene_dir / "depth" / f"{args.im_id:06d}.png"
+        scene_camera_path = scene_dir / "scene_camera.json"
+
+        for path, label in (
+            (query_cache, "query cache"),
+            (rgb_path, "RGB image"),
+            (depth_path, "depth image"),
+            (scene_camera_path, "scene camera JSON"),
+            (args.mask, "mask"),
+            (args.checkpoint, "GeDi checkpoint"),
+        ):
+            if not path.is_file():
+                raise FileNotFoundError(f"{label} not found: {path}")
+        if not args.dinov2_root.is_dir():
+            raise FileNotFoundError(
+                f"local DINOv2 checkout not found: {args.dinov2_root}"
+            )
+        if not args.gedi_root.is_dir():
+            raise FileNotFoundError(f"GeDi checkout not found: {args.gedi_root}")
+
+        required_query_keys = (
+            "pca_mean",
+            "pca_components",
+            "pca_dim",
+            "diameter",
+            "dino_layer",
+            "dino_facet",
+            "dino_model",
+        )
+        with np.load(query_cache, allow_pickle=False) as data:
+            missing = [key for key in required_query_keys if key not in data]
+            if missing:
+                raise KeyError(
+                    "query cache is missing: " + ", ".join(missing)
+                )
+            pca_mean = np.asarray(data["pca_mean"], dtype=np.float64)
+            pca_components = np.asarray(data["pca_components"], dtype=np.float64)
+            pca_dim = int(data["pca_dim"])
+            diameter = float(data["diameter"])
+            dino_layer = int(data["dino_layer"])
+            dino_facet = str(np.asarray(data["dino_facet"]).item())
+            dino_model = str(np.asarray(data["dino_model"]).item())
+
+        if pca_mean.ndim != 1 or pca_components.ndim != 2:
+            raise ValueError("invalid PCA state in query cache")
+        if pca_components.shape != (pca_dim, len(pca_mean)):
+            raise ValueError("query PCA component shape is inconsistent")
+        if pca_dim != 64:
+            raise ValueError("Task 5 expects a 64D saved query PCA")
+        if diameter <= 0:
+            raise ValueError("query object diameter must be positive")
+        if not np.isfinite(pca_mean).all() or not np.isfinite(pca_components).all():
+            raise ValueError("query PCA state contains non-finite values")
+
+        scene_camera = json.loads(scene_camera_path.read_text())
+        camera_info = scene_camera.get(str(args.im_id))
+        if camera_info is None:
+            camera_info = scene_camera.get(f"{args.im_id:06d}")
+        if camera_info is None:
+            raise KeyError(
+                f"image {args.im_id} missing from {scene_camera_path}"
+            )
+        if "cam_K" not in camera_info:
+            raise KeyError(f"cam_K missing for image {args.im_id}")
+        K = np.asarray(camera_info["cam_K"], dtype=np.float64).reshape(3, 3)
+        depth_scale = float(camera_info.get("depth_scale", 1.0))
+        if depth_scale <= 0:
+            raise ValueError("depth_scale must be positive")
+        if not np.isfinite(K).all() or K[0, 0] == 0 or K[1, 1] == 0:
+            raise ValueError("invalid camera intrinsic matrix")
+
+        rgb = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8).copy()
+        depth_raw = np.asarray(Image.open(depth_path))
+        mask_raw = np.asarray(Image.open(args.mask))
+        if mask_raw.ndim == 3:
+            mask = np.any(mask_raw != 0, axis=2)
+        else:
+            mask = mask_raw != 0
+        if depth_raw.shape[:2] != rgb.shape[:2]:
+            raise ValueError("RGB and depth images have different sizes")
+        if mask.shape != rgb.shape[:2]:
+            raise ValueError("mask and RGB image have different sizes")
+
+        depth_mm = np.asarray(depth_raw, dtype=np.float32) * np.float32(depth_scale)
+        valid_mask = mask & np.isfinite(depth_mm) & (depth_mm > 0)
+        dense_all, _ = backproject_depth(depth_mm, K, valid_mask)
+        if len(dense_all) == 0:
+            raise ValueError("mask contains no valid depth pixels")
+        rng = np.random.default_rng(args.seed)
+        dense_count = min(int(args.dense_size), len(dense_all))
+        dense_ids = rng.choice(len(dense_all), size=dense_count, replace=False)
+        dense_points = np.asarray(dense_all[dense_ids], dtype=np.float32)
+
+        dino = DinoExtractor(
+            device=args.device,
+            layer=dino_layer,
+            facet=dino_facet,
+            model_name=dino_model,
+            repo_or_dir=args.dinov2_root,
+        )
+        crop_h, crop_w = dino.compatible_image_hw(rgb.shape[:2])
+        dino_valid_mask = valid_mask.copy()
+        dino_valid_mask[crop_h:, :] = False
+        dino_valid_mask[:, crop_w:] = False
+        sparse_pixels = sparse_grid_pixels(dino_valid_mask, args.grid_size)
+        if len(sparse_pixels) == 0:
+            raise ValueError("mask has no valid sparse pixels inside the DINO crop")
+        if len(sparse_pixels) > args.grid_size * args.grid_size:
+            raise RuntimeError("sparse grid returned more than grid_size^2 pixels")
+
+        u = sparse_pixels[:, 0].astype(np.float64)
+        v = sparse_pixels[:, 1].astype(np.float64)
+        z = depth_mm[sparse_pixels[:, 1], sparse_pixels[:, 0]].astype(np.float64)
+        x = (u - K[0, 2]) * z / K[0, 0]
+        y = (v - K[1, 2]) * z / K[1, 1]
+        sparse_points = np.stack((x, y, z), axis=1).astype(np.float32)
+
+        feature_map = dino.encode(rgb)
+        dino_image_hw = getattr(dino, "last_image_hw", None)
+        if dino_image_hw is None:
+            dino_image_hw = (crop_h, crop_w)
+        dino_image_hw = tuple(map(int, dino_image_hw))
+        dino_pixels = sparse_pixels.astype(np.float32) + 0.5
+        sampled = sample_feature_map(
+            feature_map,
+            dino_pixels,
+            image_hw=dino_image_hw,
+        )
+        visual_features = (
+            sampled.detach().to("cpu").numpy().astype(np.float32, copy=False)
+        )
+        del feature_map
+        if visual_features.shape != (len(sparse_pixels), len(pca_mean)):
+            raise RuntimeError(
+                "target DINO feature shape does not match the saved query PCA: "
+                f"{visual_features.shape} vs (*, {len(pca_mean)})"
+            )
+        if not np.isfinite(visual_features).all():
+            raise RuntimeError("target visual features contain non-finite values")
+
+        gedi_extractor = GediExtractor(
+            checkpoint=args.checkpoint,
+            gedi_root=args.gedi_root,
+            seed=args.seed,
+        )
+        geometric = np.asarray(
+            gedi_extractor.encode(
+                sparse_points,
+                dense_points,
+                object_diameter=diameter,
+            ),
+            dtype=np.float32,
+        )
+        if geometric.shape != (len(sparse_points), 64):
+            raise RuntimeError(f"unexpected target GeDi shape: {geometric.shape}")
+        if not np.isfinite(geometric).all():
+            raise RuntimeError("target geometric features contain non-finite values")
+
+        pca_state = VisualPCA(mean=pca_mean, components=pca_components)
+        target_features = fuse_visual_geometric(
+            visual_features,
+            geometric,
+            pca_state,
+        )
+        if target_features.shape != (len(sparse_points), 128):
+            raise RuntimeError(
+                f"unexpected target fused shape: {target_features.shape}"
+            )
+        if not np.isfinite(target_features).all():
+            raise RuntimeError("target fused features contain non-finite values")
+
+        visual_norms = np.linalg.norm(target_features[:, :64], axis=1)
+        geometric_norms = np.linalg.norm(target_features[:, 64:], axis=1)
+        output = args.output or (
+            Path("outputs/targets")
+            / (
+                f"{args.dataset}_scene_{args.scene_id:06d}_im_{args.im_id:06d}_"
+                f"obj_{args.obj_id:06d}_{args.mask.stem}.npz"
+            )
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            sparse_pixels=np.asarray(sparse_pixels, dtype=np.int32),
+            sparse_points=sparse_points,
+            dense_points=dense_points,
+            visual_features=visual_features,
+            geometric_features=geometric,
+            target_features=target_features,
+            cam_K=K.astype(np.float32),
+            depth_scale=np.float32(depth_scale),
+            diameter=np.float32(diameter),
+            scene_id=np.int32(args.scene_id),
+            im_id=np.int32(args.im_id),
+            obj_id=np.int32(args.obj_id),
+            grid_size=np.int32(args.grid_size),
+            dense_size_requested=np.int32(args.dense_size),
+            dense_valid_count=np.int32(len(dense_all)),
+            seed=np.int32(args.seed),
+            dino_layer=np.int32(dino_layer),
+            dino_facet=np.array(dino_facet),
+            dino_model=np.array(dino_model),
+            dino_image_hw=np.asarray(dino_image_hw, dtype=np.int32),
+            query_source=np.array(str(query_cache)),
+            rgb_source=np.array(str(rgb_path)),
+            depth_source=np.array(str(depth_path)),
+            mask_source=np.array(str(args.mask)),
+            scene_camera_source=np.array(str(scene_camera_path)),
+        )
+        print(json.dumps({
+            "dataset": args.dataset,
+            "scene_id": args.scene_id,
+            "im_id": args.im_id,
+            "obj_id": args.obj_id,
+            "depth_scale": depth_scale,
+            "valid_mask_depth_pixels": int(valid_mask.sum()),
+            "sparse_pixels": list(sparse_pixels.shape),
+            "sparse_points": list(sparse_points.shape),
+            "dense_points": list(dense_points.shape),
+            "visual_features": list(visual_features.shape),
+            "geometric_features": list(geometric.shape),
+            "target_features": list(target_features.shape),
+            "visual_branch_norm_range": [
+                float(visual_norms.min()),
+                float(visual_norms.max()),
+            ],
+            "geometric_branch_norm_range": [
+                float(geometric_norms.min()),
+                float(geometric_norms.max()),
+            ],
+            "finite": bool(np.isfinite(target_features).all()),
+            "output": str(output),
+        }, indent=2, sort_keys=True))
         return
 
     if args.command == "extract-query-visual":
