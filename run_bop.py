@@ -23,8 +23,67 @@ from freezev2.fusion import VisualPCA, fit_visual_pca, fuse_visual_geometric
 from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
 from freezev2.geometry import backproject_depth
 from freezev2.onboard import load_onboarding_templates
-from freezev2.pose import sparse_grid_pixels
 from freezev2.query_features import aggregate_query_visual_features_streaming
+
+
+def _sample_mask_patch_centers(
+    mask: np.ndarray,
+    grid_size: int = 16,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return paper-style patch centers in the smallest square mask bbox.
+
+    FreeZeV2 samples a ``grid_size x grid_size`` grid inside the smallest
+    axis-aligned square bounding box enclosing the candidate mask, then keeps
+    only patch centers that fall inside the mask. ``centers`` are expressed in
+    raster/window coordinates, where pixel-cell boundaries are integers. The
+    paired integer ``pixels`` select the depth cell containing each center.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("mask must have shape HxW")
+    grid_size = int(grid_size)
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int64),
+        )
+
+    # Treat integer array indices as pixel-cell lower boundaries. The mask bbox
+    # therefore spans [min_index, max_index + 1] in raster coordinates.
+    x0 = float(xs.min())
+    x1 = float(xs.max() + 1)
+    y0 = float(ys.min())
+    y1 = float(ys.max() + 1)
+    side = max(x1 - x0, y1 - y0)
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    square_x0 = cx - 0.5 * side
+    square_y0 = cy - 0.5 * side
+    step = side / grid_size
+
+    axis = np.arange(grid_size, dtype=np.float64) + 0.5
+    x_centers = square_x0 + axis * step
+    y_centers = square_y0 + axis * step
+    xx, yy = np.meshgrid(x_centers, y_centers, indexing="xy")
+    centers = np.stack((xx.ravel(), yy.ravel()), axis=1)
+    pixels = np.floor(centers).astype(np.int64)
+
+    h, w = mask.shape
+    inside = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < w)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < h)
+    )
+    keep = np.zeros(len(centers), dtype=bool)
+    ids = np.flatnonzero(inside)
+    if len(ids):
+        keep[ids] = mask[pixels[ids, 1], pixels[ids, 0]]
+    return centers[keep].astype(np.float32), pixels[keep]
 
 
 def main() -> None:
@@ -262,17 +321,39 @@ def main() -> None:
             repo_or_dir=args.dinov2_root,
         )
         crop_h, crop_w = dino.compatible_image_hw(rgb.shape[:2])
-        dino_valid_mask = valid_mask.copy()
-        dino_valid_mask[crop_h:, :] = False
-        dino_valid_mask[:, crop_w:] = False
-        sparse_pixels = sparse_grid_pixels(dino_valid_mask, args.grid_size)
-        if len(sparse_pixels) == 0:
-            raise ValueError("mask has no valid sparse pixels inside the DINO crop")
-        if len(sparse_pixels) > args.grid_size * args.grid_size:
-            raise RuntimeError("sparse grid returned more than grid_size^2 pixels")
 
-        u = sparse_pixels[:, 0].astype(np.float64)
-        v = sparse_pixels[:, 1].astype(np.float64)
+        sparse_image_xy, sparse_pixels = _sample_mask_patch_centers(
+            mask,
+            args.grid_size,
+        )
+        if len(sparse_pixels) == 0:
+            raise ValueError("mask has no retained patch centers")
+
+        inside_crop = (
+            (sparse_image_xy[:, 0] >= 0.0)
+            & (sparse_image_xy[:, 0] < crop_w)
+            & (sparse_image_xy[:, 1] >= 0.0)
+            & (sparse_image_xy[:, 1] < crop_h)
+        )
+        sparse_depth = depth_mm[sparse_pixels[:, 1], sparse_pixels[:, 0]]
+        valid_sparse_depth = np.isfinite(sparse_depth) & (sparse_depth > 0)
+        keep_sparse = inside_crop & valid_sparse_depth
+        sparse_image_xy = sparse_image_xy[keep_sparse]
+        sparse_pixels = sparse_pixels[keep_sparse]
+        if len(sparse_pixels) == 0:
+            raise ValueError(
+                "mask has no valid sparse patch centers inside the DINO crop"
+            )
+        if len(sparse_pixels) > args.grid_size * args.grid_size:
+            raise RuntimeError("sparse grid returned more than grid_size^2 points")
+
+        # BOP/OpenCV K uses integer pixel-center coordinates, while the DINO
+        # sampling convention uses raster/window coordinates with pixel centers
+        # at half-integers. Convert the continuous patch centers back by 0.5 for
+        # 3D backprojection, but keep the original centers for DINO sampling.
+        opencv_xy = sparse_image_xy.astype(np.float64) - 0.5
+        u = opencv_xy[:, 0]
+        v = opencv_xy[:, 1]
         z = depth_mm[sparse_pixels[:, 1], sparse_pixels[:, 0]].astype(np.float64)
         x = (u - K[0, 2]) * z / K[0, 0]
         y = (v - K[1, 2]) * z / K[1, 1]
@@ -283,10 +364,9 @@ def main() -> None:
         if dino_image_hw is None:
             dino_image_hw = (crop_h, crop_w)
         dino_image_hw = tuple(map(int, dino_image_hw))
-        dino_pixels = sparse_pixels.astype(np.float32) + 0.5
         sampled = sample_feature_map(
             feature_map,
-            dino_pixels,
+            sparse_image_xy,
             image_hw=dino_image_hw,
         )
         visual_features = (
@@ -345,6 +425,7 @@ def main() -> None:
         np.savez_compressed(
             output,
             sparse_pixels=np.asarray(sparse_pixels, dtype=np.int32),
+            sparse_image_xy=np.asarray(sparse_image_xy, dtype=np.float32),
             sparse_points=sparse_points,
             dense_points=dense_points,
             visual_features=visual_features,
@@ -364,6 +445,7 @@ def main() -> None:
             dino_facet=np.array(dino_facet),
             dino_model=np.array(dino_model),
             dino_image_hw=np.asarray(dino_image_hw, dtype=np.int32),
+            sparse_sampling=np.array("square_bbox_patch_centers"),
             query_source=np.array(str(query_cache)),
             rgb_source=np.array(str(rgb_path)),
             depth_source=np.array(str(depth_path)),
@@ -377,6 +459,7 @@ def main() -> None:
             "obj_id": args.obj_id,
             "depth_scale": depth_scale,
             "valid_mask_depth_pixels": int(valid_mask.sum()),
+            "sparse_image_xy": list(sparse_image_xy.shape),
             "sparse_pixels": list(sparse_pixels.shape),
             "sparse_points": list(sparse_points.shape),
             "dense_points": list(dense_points.shape),
