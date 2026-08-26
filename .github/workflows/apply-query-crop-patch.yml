@@ -1,4 +1,4 @@
-name: Apply paper query crop patch
+name: Apply query crop metadata patch
 
 on:
   push:
@@ -17,48 +17,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Patch query_features.py
+      - name: Patch run_bop.py
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          path = Path("freezev2/query_features.py")
+          path = Path("run_bop.py")
           text = path.read_text()
 
-          old = '''from .features import sample_feature_map\nfrom .onboard import Template\n'''
-          new = '''from .features import sample_feature_map\nfrom .onboard import Template\nfrom .query_crop import (\n    QUERY_DINO_INPUT_SIZE,\n    QUERY_DINO_MODE,\n    QUERY_DINO_PATCH_GRID,\n    query_object_crop_bbox,\n    renderer_pixels_to_query_crop_xy,\n    resize_query_object_crop,\n)\n'''
+          old = '''from freezev2.pipeline import estimate_pose_from_features\nfrom freezev2.query_features import (\n'''
+          new = '''from freezev2.pipeline import estimate_pose_from_features\nfrom freezev2.query_crop import (\n    QUERY_DINO_INPUT_SIZE,\n    QUERY_DINO_MODE,\n    QUERY_DINO_PATCH_GRID,\n)\nfrom freezev2.query_features import (\n'''
           if text.count(old) != 1:
               raise SystemExit(f"import anchor count={text.count(old)}")
           text = text.replace(old, new, 1)
 
-          old = '''    for template in templates:\n        feature_map = extractor.encode(template.rgb)\n'''
-          new = '''    for template in templates:\n        crop_bbox = query_object_crop_bbox(template.mask)\n        dino_rgb = resize_query_object_crop(\n            template.rgb,\n            crop_bbox,\n            output_size=QUERY_DINO_INPUT_SIZE,\n        )\n        feature_map = extractor.encode(dino_rgb)\n'''
+          old = '''            visual_aggregation=np.array("pixel_lift_nn_view_uniform"),\n            visual_weighting_candidate=np.array("pixel_support"),\n'''
+          new = '''            visual_aggregation=np.array("tight_crop_224_pixel_lift_nn_view_uniform"),\n            visual_weighting_candidate=np.array("pixel_support"),\n            query_dino_mode=np.array(QUERY_DINO_MODE),\n            query_dino_input_hw=np.asarray(\n                [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE], dtype=np.int32\n            ),\n            query_dino_patch_grid=np.asarray(\n                [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID], dtype=np.int32\n            ),\n'''
           if text.count(old) != 1:
-              raise SystemExit(f"encode anchor count={text.count(old)}")
+              raise SystemExit(f"save metadata anchor count={text.count(old)}")
           text = text.replace(old, new, 1)
 
-          old = '''        if feature_map.ndim != 3:\n            raise ValueError("DINO extractor must return a CxHxW feature map")\n        if not feature_map.is_floating_point():\n            feature_map = feature_map.to(torch.float32)\n\n        image_hw = getattr(extractor, "last_image_hw", None)\n        if image_hw is None:\n            image_hw = tuple(map(int, template.depth.shape[:2]))\n        image_h, image_w = map(int, image_hw)\n        if image_h <= 0 or image_w <= 0:\n            raise ValueError("DINO image size must be positive")\n        if image_h > template.depth.shape[0] or image_w > template.depth.shape[1]:\n            raise ValueError("DINO image area exceeds rendered depth dimensions")\n'''
-          new = '''        if feature_map.ndim != 3:\n            raise ValueError("DINO extractor must return a CxHxW feature map")\n        if not feature_map.is_floating_point():\n            feature_map = feature_map.to(torch.float32)\n\n        image_hw = getattr(extractor, "last_image_hw", None)\n        if image_hw is None:\n            image_hw = (QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE)\n        image_h, image_w = map(int, image_hw)\n        expected_hw = (QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE)\n        if (image_h, image_w) != expected_hw:\n            raise RuntimeError(\n                f"query DINO consumed {(image_h, image_w)}, expected {expected_hw}"\n            )\n        expected_grid = (QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID)\n        if tuple(map(int, feature_map.shape[1:])) != expected_grid:\n            raise RuntimeError(\n                f"query DINO feature grid is {tuple(feature_map.shape[1:])}, "\n                f"expected {expected_grid}"\n            )\n'''
+          old = '''            "visual_aggregation": "pixel_lift_nn_view_uniform",\n            "visual_weighting_candidate": "pixel_support",\n'''
+          new = '''            "visual_aggregation": "tight_crop_224_pixel_lift_nn_view_uniform",\n            "visual_weighting_candidate": "pixel_support",\n            "query_dino_mode": QUERY_DINO_MODE,\n            "query_dino_input_hw": [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE],\n            "query_dino_patch_grid": [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID],\n'''
           if text.count(old) != 1:
-              raise SystemExit(f"image-hw anchor count={text.count(old)}")
+              raise SystemExit(f"report metadata anchor count={text.count(old)}")
           text = text.replace(old, new, 1)
 
-          old = '''        depth = np.asarray(template.depth[:image_h, :image_w], dtype=np.float64)\n        mask = np.asarray(template.mask[:image_h, :image_w], dtype=bool)\n'''
-          new = '''        # DINO sees the 224x224 object crop, but geometry remains in the\n        # original renderer frame exactly as described by FreeZe.\n        depth = np.asarray(template.depth, dtype=np.float64)\n        mask = np.asarray(template.mask, dtype=bool)\n'''
+          old = '''                "visual_aggregation",\n                "visual_weighting_candidate",\n                "dino_layer",\n'''
+          new = '''                "visual_aggregation",\n                "visual_weighting_candidate",\n                "query_dino_mode",\n                "query_dino_input_hw",\n                "query_dino_patch_grid",\n                "dino_layer",\n'''
           if text.count(old) != 1:
-              raise SystemExit(f"depth anchor count={text.count(old)}")
-          text = text.replace(old, new, 1)
-
-          old = '''            image_xy = pixels.astype(np.float32) + 0.5\n            sampled = sample_feature_map(\n'''
-          new = '''            image_xy = renderer_pixels_to_query_crop_xy(\n                pixels,\n                crop_bbox,\n                output_size=QUERY_DINO_INPUT_SIZE,\n            ).astype(np.float32, copy=False)\n            sampled = sample_feature_map(\n'''
-          if text.count(old) != 1:
-              raise SystemExit(f"sample anchor count={text.count(old)}")
-          text = text.replace(old, new, 1)
-
-          old = '''    The DINO feature map is not materialized at full image resolution. Sampling\n    it at every foreground pixel center with ``grid_sample`` is mathematically\n    equivalent to bilinear upsampling with ``align_corners=False`` while keeping\n    memory bounded.\n'''
-          new = '''    Following FreeZe, each rendered object mask first defines a tight RGB crop;\n    that crop is resized to 224x224 and encoded into the published 16x16 DINO\n    patch grid. Foreground pixels remain in the original renderer frame for depth\n    lifting, while their centers are mapped into the resized crop to sample the\n    bilinearly upsampled visual features. The dense pixel feature tensor is not\n    materialized: chunked ``grid_sample`` is mathematically equivalent to the\n    published bilinear patch-to-pixel interpolation while keeping memory bounded.\n'''
-          if text.count(old) != 1:
-              raise SystemExit(f"doc anchor count={text.count(old)}")
+              raise SystemExit(f"fusion metadata anchor count={text.count(old)}")
           text = text.replace(old, new, 1)
 
           path.write_text(text)
@@ -68,7 +56,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add freezev2/query_features.py
+          git add run_bop.py
           git diff --cached --check
-          git commit -m "fix: crop query renders before DINO"
+          git commit -m "feat: record query crop preprocessing metadata"
           git push
