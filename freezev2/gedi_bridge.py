@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import importlib.util
+import subprocess
+import sys
+import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+from .gedi_radius import ml3d
 
 
 GEDI_REPO_COMMIT = "b3dd86776750d8221f89d39975118da9839b39f7"
@@ -56,12 +63,66 @@ def _as_points(points, name: str) -> np.ndarray:
     return points
 
 
+@contextmanager
+def _radius_search_import_shim():
+    """Temporarily satisfy GeDi's Open3D-ML import with our ABI-free ops shim."""
+    names = ("open3d", "open3d.ml", "open3d.ml.torch")
+    previous = {name: sys.modules.get(name) for name in names}
+
+    open3d = types.ModuleType("open3d")
+    open3d.__path__ = []
+    open3d_ml = types.ModuleType("open3d.ml")
+    open3d_ml.__path__ = []
+    open3d_ml_torch = types.ModuleType("open3d.ml.torch")
+    open3d_ml_torch.ops = ml3d.ops
+    open3d.ml = open3d_ml
+    open3d_ml.torch = open3d_ml_torch
+
+    sys.modules["open3d"] = open3d
+    sys.modules["open3d.ml"] = open3d_ml
+    sys.modules["open3d.ml.torch"] = open3d_ml_torch
+    try:
+        yield
+    finally:
+        for name in names:
+            old = previous[name]
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
+def _load_official_gedi_class(gedi_root: str | Path):
+    """Load pinned official GeDi code while replacing only radius_search."""
+    gedi_root = Path(gedi_root).resolve()
+    gedi_path = gedi_root / "gedi.py"
+    if not gedi_path.is_file():
+        raise FileNotFoundError(gedi_path)
+
+    module_name = "_freezev2_official_gedi"
+    spec = importlib.util.spec_from_file_location(module_name, gedi_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load official GeDi module from {gedi_path}")
+    module = importlib.util.module_from_spec(spec)
+
+    sys.path.insert(0, str(gedi_root))
+    try:
+        with _radius_search_import_shim():
+            spec.loader.exec_module(module)
+    finally:
+        try:
+            sys.path.remove(str(gedi_root))
+        except ValueError:
+            pass
+    return module.GeDi
+
+
 class GediExtractor:
     """Frozen adapter around the pinned official GeDi implementation.
 
-    The official GeDi implementation owns the model architecture and CUDA
-    kernels. This adapter only fixes FreeZeV2's two relative neighbourhood
-    scales, validates outputs, and concatenates the two 32D branches.
+    The official GeDi implementation and PointNet2 network remain unchanged.
+    Only its Open3D-ML radius-search dependency is replaced by an equivalent
+    CPU radius search so the extractor is not tied to Open3D's PyTorch ABI.
     """
 
     def __init__(
@@ -80,9 +141,6 @@ class GediExtractor:
             raise ValueError("official GeDi inference requires a CUDA device")
 
         if backend is None:
-            import subprocess
-            import sys
-
             if not self.checkpoint.is_file():
                 raise FileNotFoundError(self.checkpoint)
             if not self.gedi_root.is_dir():
@@ -98,11 +156,9 @@ class GediExtractor:
                     f"expected {GEDI_REPO_COMMIT}, got {head}"
                 )
 
-            sys.path.insert(0, str(self.gedi_root.resolve()))
             import torch
-            from gedi import GeDi
 
-            backend = (torch, GeDi)
+            backend = (torch, _load_official_gedi_class(self.gedi_root))
 
         self._torch, self._gedi_cls = backend
         if not self._torch.cuda.is_available():
