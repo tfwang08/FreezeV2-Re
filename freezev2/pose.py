@@ -162,9 +162,13 @@ def _nearest_neighbor_indices(
         d2 = block_sq[:, None] + target_sq[None, :] - 2.0 * (block @ target_t)
         np.maximum(d2, 0.0, out=d2)
         local = np.argmin(d2, axis=1)
-        row = np.arange(len(block))
         indices[start:stop] = local
-        distances[start:stop] = np.sqrt(d2[row, local])
+        # The dot-product identity is stable enough to select the argmin, but
+        # can lose a few microns to cancellation for nearly coincident points
+        # hundreds of millimetres from the origin. Recompute only the selected
+        # pairs directly so debug RMSE and thresholding use exact Euclidean
+        # distances without material extra memory.
+        distances[start:stop] = np.linalg.norm(block - target[local], axis=1)
     return indices, distances
 
 
