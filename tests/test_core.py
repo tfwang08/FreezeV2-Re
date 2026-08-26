@@ -2,7 +2,12 @@ import csv
 import numpy as np
 from freezev2.geometry import backproject_depth, kabsch
 from freezev2.matching import topk_cosine_matches
-from freezev2.pose import _score_hypothesis, feature_aware_ransac, sparse_grid_pixels
+from freezev2.pose import (
+    _score_hypothesis,
+    _triplet_edges_compatible,
+    feature_aware_ransac,
+    sparse_grid_pixels,
+)
 from freezev2.pipeline import estimate_pose_from_features
 from freezev2.bop import write_bop_csv
 
@@ -68,6 +73,57 @@ def test_feature_aware_score_sums_all_inlier_correspondences():
     # then divide by the number of sparse target points. Both correspondences
     # are exact geometric inliers here, with cosine 1.0 and 0.5.
     np.testing.assert_allclose(score, 1.5)
+
+
+def test_triplet_edge_pruning_rejects_incompatible_correspondences():
+    src = np.array([
+        [0.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0],
+    ])
+    compatible = src + np.array([30.0, -20.0, 100.0])
+    incompatible = compatible.copy()
+    incompatible[1, 0] += 4.0
+
+    assert _triplet_edges_compatible(src, compatible, tolerance=1.0)
+    assert not _triplet_edges_compatible(src, incompatible, tolerance=1.0)
+
+
+def test_feature_aware_ransac_returns_winning_diagnostics():
+    query_points = np.array([
+        [0.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0],
+        [0.0, 0.0, 10.0],
+    ])
+    query_features = np.eye(4, dtype=np.float64)
+    translation = np.array([100.0, -50.0, 600.0])
+    target_points = query_points + translation
+    target_features = query_features.copy()
+    candidate_query_indices = np.arange(4, dtype=np.int64)[:, None]
+
+    pose, score, debug = feature_aware_ransac(
+        query_points=query_points,
+        query_features=query_features,
+        target_points=target_points,
+        target_features=target_features,
+        candidate_query_indices=candidate_query_indices,
+        inlier_threshold=0.5,
+        edge_tolerance=0.5,
+        iterations=50,
+        seed=3,
+        return_debug=True,
+    )
+
+    np.testing.assert_allclose(pose[:3, :3], np.eye(3), atol=1e-8)
+    np.testing.assert_allclose(pose[:3, 3], translation, atol=1e-8)
+    np.testing.assert_allclose(score, 1.0, atol=1e-8)
+    assert debug["inlier_count"] == 4
+    assert debug["inlier_target_count"] == 4
+    assert debug["winning_target_indices"].shape == (3,)
+    assert debug["winning_candidate_columns"].shape == (3,)
+    assert debug["winning_query_indices"].shape == (3,)
+    np.testing.assert_allclose(debug["edge_tolerance"], 0.5)
 
 
 def test_feature_aware_pipeline_recovers_pose():
