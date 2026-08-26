@@ -75,3 +75,62 @@ def test_extract_query_gedi_reads_model_diameter_and_saves_64d(
         assert data["geometric_features_40"].shape == (5, 32)
         assert data["geometric_features"].shape == (5, 64)
         np.testing.assert_allclose(data["radii"], [30.0, 40.0])
+
+
+def test_fuse_query_features_saves_128d_and_query_pca(tmp_path, monkeypatch):
+    rng = np.random.default_rng(7)
+    points = rng.normal(size=(80, 3)).astype(np.float32)
+    visual = rng.normal(size=(80, 96)).astype(np.float32)
+    geometric = rng.normal(size=(80, 64)).astype(np.float32)
+
+    visual_path = tmp_path / "visual.npz"
+    geometric_path = tmp_path / "gedi.npz"
+    output = tmp_path / "query.npz"
+    np.savez_compressed(
+        visual_path,
+        query_points=points,
+        visual_features=visual,
+    )
+    np.savez_compressed(
+        geometric_path,
+        query_points=points,
+        geometric_features=geometric,
+        diameter=np.float32(100.0),
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "fuse-query-features",
+        "--dataset",
+        "lmo",
+        "--obj-id",
+        "1",
+        "--visual",
+        str(visual_path),
+        "--geometric",
+        str(geometric_path),
+        "--output",
+        str(output),
+    ])
+
+    run_bop.main()
+
+    with np.load(output, allow_pickle=False) as data:
+        fused = np.asarray(data["fused_features"], dtype=np.float32)
+        assert data["query_points"].shape == (80, 3)
+        assert fused.shape == (80, 128)
+        assert data["pca_mean"].shape == (96,)
+        assert data["pca_components"].shape == (64, 96)
+        assert int(data["pca_dim"]) == 64
+        assert float(data["diameter"]) == 100.0
+        np.testing.assert_allclose(
+            np.linalg.norm(fused[:, :64], axis=1),
+            1.0,
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.linalg.norm(fused[:, 64:], axis=1),
+            1.0,
+            atol=1e-5,
+        )
+        assert np.isfinite(fused).all()
