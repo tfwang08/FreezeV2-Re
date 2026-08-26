@@ -6,6 +6,14 @@ import numpy as np
 
 from .features import sample_feature_map
 from .onboard import Template
+from .query_crop import (
+    QUERY_DINO_INPUT_SIZE,
+    QUERY_DINO_MODE,
+    QUERY_DINO_PATCH_GRID,
+    query_object_crop_bbox,
+    renderer_pixels_to_query_crop_xy,
+    resize_query_object_crop,
+)
 from .raster import visible_query_image_coordinates
 
 
@@ -160,10 +168,13 @@ def aggregate_query_visual_features_pixel_lifting_streaming(
       so this branch is intentionally retained only as a reverse-engineering
       candidate.
 
-    The DINO feature map is not materialized at full image resolution. Sampling
-    it at every foreground pixel center with ``grid_sample`` is mathematically
-    equivalent to bilinear upsampling with ``align_corners=False`` while keeping
-    memory bounded.
+    Following FreeZe, each rendered object mask first defines a tight RGB crop;
+    that crop is resized to 224x224 and encoded into the published 16x16 DINO
+    patch grid. Foreground pixels remain in the original renderer frame for depth
+    lifting, while their centers are mapped into the resized crop to sample the
+    bilinearly upsampled visual features. The dense pixel feature tensor is not
+    materialized: chunked ``grid_sample`` is mathematically equivalent to the
+    published bilinear patch-to-pixel interpolation while keeping memory bounded.
     """
     try:
         import torch
@@ -199,7 +210,13 @@ def aggregate_query_visual_features_pixel_lifting_streaming(
     feature_dim = None
 
     for template in templates:
-        feature_map = extractor.encode(template.rgb)
+        crop_bbox = query_object_crop_bbox(template.mask)
+        dino_rgb = resize_query_object_crop(
+            template.rgb,
+            crop_bbox,
+            output_size=QUERY_DINO_INPUT_SIZE,
+        )
+        feature_map = extractor.encode(dino_rgb)
         if not torch.is_tensor(feature_map):
             feature_map = torch.as_tensor(feature_map)
         if feature_map.ndim != 3:
@@ -209,12 +226,19 @@ def aggregate_query_visual_features_pixel_lifting_streaming(
 
         image_hw = getattr(extractor, "last_image_hw", None)
         if image_hw is None:
-            image_hw = tuple(map(int, template.depth.shape[:2]))
+            image_hw = (QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE)
         image_h, image_w = map(int, image_hw)
-        if image_h <= 0 or image_w <= 0:
-            raise ValueError("DINO image size must be positive")
-        if image_h > template.depth.shape[0] or image_w > template.depth.shape[1]:
-            raise ValueError("DINO image area exceeds rendered depth dimensions")
+        expected_hw = (QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE)
+        if (image_h, image_w) != expected_hw:
+            raise RuntimeError(
+                f"query DINO consumed {(image_h, image_w)}, expected {expected_hw}"
+            )
+        expected_grid = (QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID)
+        if tuple(map(int, feature_map.shape[1:])) != expected_grid:
+            raise RuntimeError(
+                f"query DINO feature grid is {tuple(feature_map.shape[1:])}, "
+                f"expected {expected_grid}"
+            )
 
         if feature_dim is None:
             feature_dim = int(feature_map.shape[0])
@@ -242,8 +266,10 @@ def aggregate_query_visual_features_pixel_lifting_streaming(
             if feature_map.device != query_points_t.device:
                 raise ValueError("all DINO views must be encoded on the same device")
 
-        depth = np.asarray(template.depth[:image_h, :image_w], dtype=np.float64)
-        mask = np.asarray(template.mask[:image_h, :image_w], dtype=bool)
+        # DINO sees the 224x224 object crop, but geometry remains in the
+        # original renderer frame exactly as described by FreeZe.
+        depth = np.asarray(template.depth, dtype=np.float64)
+        mask = np.asarray(template.mask, dtype=bool)
         foreground = mask & np.isfinite(depth) & (depth > 0)
         pixel_y, pixel_x = np.nonzero(foreground)
         if len(pixel_x) == 0:
@@ -264,7 +290,11 @@ def aggregate_query_visual_features_pixel_lifting_streaming(
             pixels = np.stack(
                 (pixel_x[start:stop], pixel_y[start:stop]), axis=1
             ).astype(np.int64, copy=False)
-            image_xy = pixels.astype(np.float32) + 0.5
+            image_xy = renderer_pixels_to_query_crop_xy(
+                pixels,
+                crop_bbox,
+                output_size=QUERY_DINO_INPUT_SIZE,
+            ).astype(np.float32, copy=False)
             sampled = sample_feature_map(
                 feature_map,
                 image_xy,
