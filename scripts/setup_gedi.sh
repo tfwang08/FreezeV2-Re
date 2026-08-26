@@ -1,33 +1,23 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# Prebuilt-only GeDi environment setup.
+# GeDi environment setup for the supported NVIDIA profiles.
 #
-# This script intentionally does not compile Open3D or PointNet2. The binary
-# stack is pinned to Python 3.11 + PyTorch 2.2.2/CUDA 12.1 because:
-#   1. Open3D 0.19.0's released ML wheel is compatible with PyTorch 2.2.*.
-#   2. The PointNet2 3.0.0 wheel below was built with Python 3.11,
-#      PyTorch 2.2.2, CUDA 12.1, and includes sm_80 for the A800.
-#   3. Its PointNet2 CUDA/C++ sources match GeDi's vendored ops.
-# The official GeDi checkpoint remains an explicit local input because cluster
-# nodes may not have access to Google Drive.
+# Ampere (A800/A100, sm_80): Python 3.11 + PyTorch 2.2.2/CUDA 12.1.
+# Blackwell (RTX 50-series, sm_120): Python 3.11 + PyTorch 2.7.1/CUDA 12.8.
+#
+# PointNet2 is built from the exact source vendored by the pinned GeDi commit
+# for the detected GPU architecture. This avoids opaque third-party wheels
+# whose embedded cubins may target a different GPU. GeDi's Open3D-ML radius
+# search is replaced in freezev2.gedi_bridge by an equivalent CPU torch search,
+# so the Blackwell profile is not blocked by Open3D 0.19's PyTorch-2.2 ABI.
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
-
-PYTHON_MINOR="${FREEZEV2_PYTHON_MINOR:-3.11}"
-TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-2.2.2}"
-TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-0.17.2}"
-TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-2.2.2}"
 NUMPY_VERSION="${FREEZEV2_NUMPY_VERSION:-1.26.4}"
-OPEN3D_VERSION="${FREEZEV2_OPEN3D_VERSION:-0.19.0}"
 POINTNET2_VERSION="3.0.0"
-POINTNET2_WHEEL_DEFAULT="https://github.com/YanWenKun/ComfyUI-3D-Pack-LinuxWheels/releases/download/v2/pointnet2_ops-3.0.0-cp311-cp311-linux_x86_64.whl"
-POINTNET2_WHEEL="${FREEZEV2_POINTNET2_WHEEL:-$POINTNET2_WHEEL_DEFAULT}"
-
 PIP_INDEX_URL="${FREEZEV2_PIP_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pypi/simple}"
 PIP_TRUSTED_HOST="${FREEZEV2_PIP_TRUSTED_HOST:-mirrors.cloud.aliyuncs.com}"
-PYTORCH_INDEX_URL="${FREEZEV2_PYTORCH_INDEX_URL:-https://mirrors.cloud.aliyuncs.com/pytorch-wheels/cu121}"
 
 _pip_clean() {
     env \
@@ -66,8 +56,81 @@ _load_conda() {
     return 1
 }
 
+_detect_compute_capability() {
+    if [[ -n "${FREEZEV2_GPU_CC:-}" ]]; then
+        printf '%s\n' "$FREEZEV2_GPU_CC"
+        return 0
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local caps
+        caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+            | tr -d ' ' | sort -u || true)"
+        if [[ -n "$caps" ]]; then
+            if [[ "$(printf '%s\n' "$caps" | wc -l)" -ne 1 ]]; then
+                echo "[FreezeV2-Re] mixed GPU compute capabilities detected:" >&2
+                printf '%s\n' "$caps" >&2
+                echo "[FreezeV2-Re] set FREEZEV2_GPU_CC explicitly for the GPU used by this environment." >&2
+                return 2
+            fi
+            printf '%s\n' "$caps"
+            return 0
+        fi
+    fi
+
+    python - <<'PY'
+import torch
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is unavailable and nvidia-smi did not report compute capability")
+major, minor = torch.cuda.get_device_capability(0)
+print(f"{major}.{minor}")
+PY
+}
+
 _load_conda
 conda activate freeze
+
+GPU_CC="$(_detect_compute_capability)"
+read -r PROFILE PYTHON_MINOR TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION CUDA_TAG CUDA_VERSION POINTNET_ARCH < <(
+    python - "$GPU_CC" <<'PY'
+import sys
+from freezev2.gpu_stack import resolve_gpu_profile
+
+major, minor = map(int, sys.argv[1].split("."))
+p = resolve_gpu_profile((major, minor))
+print(
+    p.name,
+    p.python_minor,
+    p.torch_version,
+    p.torchvision_version,
+    p.torchaudio_version,
+    p.cuda_tag,
+    p.cuda_version,
+    p.pointnet_arch,
+)
+PY
+)
+
+PYTHON_MINOR="${FREEZEV2_PYTHON_MINOR:-$PYTHON_MINOR}"
+TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-$TORCH_VERSION}"
+TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-$TORCHVISION_VERSION}"
+TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-$TORCHAUDIO_VERSION}"
+CUDA_VERSION="${FREEZEV2_CUDA_VERSION:-$CUDA_VERSION}"
+POINTNET_ARCH="${FREEZEV2_POINTNET_ARCH:-$POINTNET_ARCH}"
+
+if [[ -n "${FREEZEV2_PYTORCH_INDEX_URL:-}" ]]; then
+    PYTORCH_INDEX_URL="$FREEZEV2_PYTORCH_INDEX_URL"
+elif [[ "$PROFILE" == "ampere" ]]; then
+    PYTORCH_INDEX_URL="https://mirrors.cloud.aliyuncs.com/pytorch-wheels/cu121"
+else
+    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+fi
+
+echo "[FreezeV2-Re] GPU compute capability: $GPU_CC"
+echo "[FreezeV2-Re] GeDi GPU profile: $PROFILE"
+echo "[FreezeV2-Re] PointNet2 target: sm_${POINTNET_ARCH/./}"
+echo "[FreezeV2-Re] PyTorch index: $PYTORCH_INDEX_URL"
+echo "[FreezeV2-Re] PyPI index: $PIP_INDEX_URL"
 
 CURRENT_PYTHON_MINOR="$(python - <<'PY'
 import sys
@@ -76,53 +139,43 @@ PY
 )"
 
 if [[ "$CURRENT_PYTHON_MINOR" != "$PYTHON_MINOR" ]]; then
-    echo "[FreezeV2-Re] switching freeze Python $CURRENT_PYTHON_MINOR -> $PYTHON_MINOR for the prebuilt PointNet2 wheel."
+    echo "[FreezeV2-Re] switching freeze Python $CURRENT_PYTHON_MINOR -> $PYTHON_MINOR."
     conda install -y -n freeze "python=$PYTHON_MINOR" pip
     hash -r
     conda activate freeze
 fi
 
-python - "$PYTHON_MINOR" <<'PY'
-import sys
-expected = sys.argv[1]
-actual = f"{sys.version_info.major}.{sys.version_info.minor}"
-print("[FreezeV2-Re] python:", sys.version.split()[0])
-if actual != expected:
-    raise SystemExit(f"expected Python {expected}, got {actual}")
-PY
-
-echo "[FreezeV2-Re] PyTorch index: $PYTORCH_INDEX_URL"
-echo "[FreezeV2-Re] PyPI index: $PIP_INDEX_URL"
-
 _stack_ready() {
-    python - <<'PY'
+    python - "$TORCH_VERSION" "$TORCHVISION_VERSION" "$TORCHAUDIO_VERSION" "$CUDA_TAG" "$CUDA_VERSION" "$GPU_CC" "$NUMPY_VERSION" <<'PY'
+import sys
+
+expected_torch, expected_tv, expected_ta, cuda_tag, expected_cuda, gpu_cc, expected_numpy = sys.argv[1:]
 try:
     import numpy as np
-    import open3d
-    import open3d.ml.torch as ml3d
     import torch
     import torchvision
     import torchaudio
 except Exception:
     raise SystemExit(1)
 
+major, minor = map(int, gpu_cc.split("."))
+expected_arch = f"sm_{major}{minor}"
 ok = (
-    torch.__version__ == "2.2.2+cu121"
-    and torch.version.cuda == "12.1"
+    torch.__version__ == f"{expected_torch}+{cuda_tag}"
+    and torchvision.__version__ == f"{expected_tv}+{cuda_tag}"
+    and torchaudio.__version__ == f"{expected_ta}+{cuda_tag}"
+    and torch.version.cuda == expected_cuda
     and torch.cuda.is_available()
-    and torchvision.__version__ == "0.17.2+cu121"
-    and torchaudio.__version__ == "2.2.2+cu121"
-    and np.__version__ == "1.26.4"
-    and open3d.__version__ == "0.19.0"
-    and ml3d._loaded
-    and open3d.core.cuda.is_available()
+    and torch.cuda.get_device_capability(0) == (major, minor)
+    and expected_arch in torch.cuda.get_arch_list()
+    and np.__version__ == expected_numpy
 )
 raise SystemExit(0 if ok else 1)
 PY
 }
 
 if ! _stack_ready; then
-    echo "[FreezeV2-Re] installing released Open3D-compatible binary stack."
+    echo "[FreezeV2-Re] installing profile-specific PyTorch stack."
     _pip_clean install \
         --force-reinstall \
         --no-cache-dir \
@@ -138,47 +191,50 @@ if ! _stack_ready; then
         --trusted-host "$PIP_TRUSTED_HOST" \
         --upgrade \
         "numpy==$NUMPY_VERSION" \
-        "open3d==$OPEN3D_VERSION" \
-        "torchgeometry==0.1.2"
+        "torchgeometry==0.1.2" \
+        "ninja>=1.11" \
+        "wheel>=0.43" \
+        "setuptools>=68"
 else
-    echo "[FreezeV2-Re] released torch/Open3D binary stack already ready."
+    echo "[FreezeV2-Re] profile-specific PyTorch stack already ready."
 fi
 
-python - <<'PY'
+python - "$TORCH_VERSION" "$TORCHVISION_VERSION" "$TORCHAUDIO_VERSION" "$CUDA_TAG" "$CUDA_VERSION" "$GPU_CC" "$NUMPY_VERSION" <<'PY'
+import sys
 import numpy as np
-import open3d
-import open3d.ml.torch as ml3d
 import torch
 import torchvision
 import torchaudio
+
+expected_torch, expected_tv, expected_ta, cuda_tag, expected_cuda, gpu_cc, expected_numpy = sys.argv[1:]
+major, minor = map(int, gpu_cc.split("."))
+expected_arch = f"sm_{major}{minor}"
 
 print("[FreezeV2-Re] torch:", torch.__version__)
 print("[FreezeV2-Re] torch CUDA:", torch.version.cuda)
 print("[FreezeV2-Re] torchvision:", torchvision.__version__)
 print("[FreezeV2-Re] torchaudio:", torchaudio.__version__)
+print("[FreezeV2-Re] NumPy:", np.__version__)
 print("[FreezeV2-Re] CUDA available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("[FreezeV2-Re] GPU:", torch.cuda.get_device_name(0))
-print("[FreezeV2-Re] NumPy:", np.__version__)
-print("[FreezeV2-Re] Open3D:", open3d.__version__)
-print("[FreezeV2-Re] Open3D CUDA available:", open3d.core.cuda.is_available())
-print("[FreezeV2-Re] Open3D ML loaded:", ml3d._loaded)
-print("[FreezeV2-Re] radius_search:", ml3d.ops.radius_search)
+    print("[FreezeV2-Re] capability:", torch.cuda.get_device_capability(0))
+    print("[FreezeV2-Re] torch arch list:", torch.cuda.get_arch_list())
 
-if torch.__version__ != "2.2.2+cu121":
+if torch.__version__ != f"{expected_torch}+{cuda_tag}":
     raise SystemExit(f"unexpected torch version: {torch.__version__}")
-if torch.version.cuda != "12.1" or not torch.cuda.is_available():
-    raise SystemExit("PyTorch CUDA 12.1 is unavailable")
-if torchvision.__version__ != "0.17.2+cu121":
+if torchvision.__version__ != f"{expected_tv}+{cuda_tag}":
     raise SystemExit(f"unexpected torchvision version: {torchvision.__version__}")
-if torchaudio.__version__ != "2.2.2+cu121":
+if torchaudio.__version__ != f"{expected_ta}+{cuda_tag}":
     raise SystemExit(f"unexpected torchaudio version: {torchaudio.__version__}")
-if np.__version__ != "1.26.4":
+if torch.version.cuda != expected_cuda or not torch.cuda.is_available():
+    raise SystemExit(f"PyTorch CUDA {expected_cuda} is unavailable")
+if torch.cuda.get_device_capability(0) != (major, minor):
+    raise SystemExit("active GPU does not match the selected profile")
+if expected_arch not in torch.cuda.get_arch_list():
+    raise SystemExit(f"PyTorch wheel does not contain {expected_arch}")
+if np.__version__ != expected_numpy:
     raise SystemExit(f"unexpected NumPy version: {np.__version__}")
-if open3d.__version__ != "0.19.0":
-    raise SystemExit(f"unexpected Open3D version: {open3d.__version__}")
-if not ml3d._loaded or not open3d.core.cuda.is_available():
-    raise SystemExit("released Open3D CUDA/PyTorch ops are unavailable")
 PY
 
 if [[ ! -d "$GEDI_ROOT/.git" ]]; then
@@ -219,35 +275,122 @@ python - "$GEDI_CHECKPOINT_CANONICAL" <<'PY'
 import sys
 import torch
 p = sys.argv[1]
-ckpt = torch.load(p, map_location="cpu")
+ckpt = torch.load(p, map_location="cpu", weights_only=False)
 if not isinstance(ckpt, dict) or "pnet_model_state_dict" not in ckpt:
     raise SystemExit("invalid GeDi checkpoint: missing pnet_model_state_dict")
 print("[FreezeV2-Re] GeDi checkpoint:", p)
 PY
 
+_nvcc_minor() {
+    nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1
+}
+
+_prepare_cuda_toolkit() {
+    if [[ -n "${FREEZEV2_CUDA_HOME:-}" ]]; then
+        export CUDA_HOME="$FREEZEV2_CUDA_HOME"
+        export PATH="$CUDA_HOME/bin:$PATH"
+    fi
+
+    local current=""
+    if command -v nvcc >/dev/null 2>&1; then
+        current="$(_nvcc_minor)"
+    fi
+
+    if [[ "$current" != "$CUDA_VERSION" ]]; then
+        echo "[FreezeV2-Re] installing CUDA $CUDA_VERSION compiler into the freeze conda env."
+        conda install -y -n freeze -c nvidia \
+            "cuda-nvcc=${CUDA_VERSION}.*" \
+            "cuda-cudart-dev=${CUDA_VERSION}.*" \
+            "cuda-cccl=${CUDA_VERSION}.*"
+        hash -r
+        conda activate freeze
+        export CUDA_HOME="$CONDA_PREFIX"
+        export PATH="$CUDA_HOME/bin:$PATH"
+        current="$(_nvcc_minor)"
+    fi
+
+    if [[ "$current" != "$CUDA_VERSION" ]]; then
+        echo "[FreezeV2-Re] STOP: nvcc $CUDA_VERSION is required to build PointNet2 for $PROFILE." >&2
+        echo "[FreezeV2-Re] current nvcc: ${current:-not found}" >&2
+        echo "[FreezeV2-Re] set FREEZEV2_CUDA_HOME to a matching CUDA toolkit if needed." >&2
+        return 3
+    fi
+
+    echo "[FreezeV2-Re] nvcc: $(command -v nvcc)"
+    echo "[FreezeV2-Re] nvcc CUDA: $current"
+}
+
 _pointnet_ready() {
-    python - <<'PY'
+    python - "$POINTNET_ARCH" <<'PY'
+import sys
 try:
     import torch
     import pointnet2_ops._ext
     from pointnet2_ops._version import __version__
     from pointnet2_ops.pointnet2_utils import furthest_point_sample
+
+    expected = tuple(map(int, sys.argv[1].split(".")))
     if __version__ != "3.0.0":
         raise RuntimeError(__version__)
+    if torch.cuda.get_device_capability(0) != expected:
+        raise RuntimeError(torch.cuda.get_device_capability(0))
     xyz = torch.rand(1, 32, 3, device="cuda", dtype=torch.float32)
     idx = furthest_point_sample(xyz, 8)
     torch.cuda.synchronize()
     if tuple(idx.shape) != (1, 8) or not idx.is_cuda:
         raise RuntimeError("bad PointNet2 CUDA output")
-except Exception:
+except Exception as exc:
+    print(f"[FreezeV2-Re] PointNet2 preflight failed: {exc}")
     raise SystemExit(1)
 PY
 }
 
+_build_pointnet_from_gedi() {
+    _prepare_cuda_toolkit
+
+    local source_dir="$GEDI_ROOT/backbones/pointnet2_ops_lib"
+    local build_dir
+    build_dir="$(mktemp -d "${TMPDIR:-/tmp}/freezev2-pointnet2.XXXXXX")"
+    cp -a "$source_dir/." "$build_dir/"
+
+    python - "$build_dir/setup.py" "$POINTNET_ARCH" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+arch = sys.argv[2]
+text = path.read_text()
+pattern = r'os\.environ\["TORCH_CUDA_ARCH_LIST"\]\s*=\s*[^\n]+'
+replacement = f'os.environ["TORCH_CUDA_ARCH_LIST"] = "{arch}"'
+new, count = re.subn(pattern, replacement, text, count=1)
+if count != 1:
+    raise SystemExit("could not patch GeDi PointNet2 TORCH_CUDA_ARCH_LIST")
+path.write_text(new)
+PY
+
+    echo "[FreezeV2-Re] building PointNet2 $POINTNET2_VERSION from pinned GeDi source for sm_${POINTNET_ARCH/./}."
+    _pip_clean install \
+        --force-reinstall \
+        --no-build-isolation \
+        --no-deps \
+        "$build_dir"
+
+    rm -rf "$build_dir"
+}
+
 if ! _pointnet_ready; then
-    echo "[FreezeV2-Re] installing prebuilt PointNet2 $POINTNET2_VERSION wheel."
-    echo "[FreezeV2-Re] PointNet2 wheel: $POINTNET2_WHEEL"
-    _pip_clean install --force-reinstall --no-deps "$POINTNET2_WHEEL"
+    if [[ -n "${FREEZEV2_POINTNET2_WHEEL:-}" ]]; then
+        echo "[FreezeV2-Re] installing explicit PointNet2 wheel override: $FREEZEV2_POINTNET2_WHEEL"
+        _pip_clean install --force-reinstall --no-deps "$FREEZEV2_POINTNET2_WHEEL"
+    else
+        _build_pointnet_from_gedi
+    fi
+fi
+
+if ! _pointnet_ready; then
+    echo "[FreezeV2-Re] STOP: PointNet2 CUDA smoke still fails for sm_${POINTNET_ARCH/./}." >&2
+    exit 6
 fi
 
 python - <<'PY'
@@ -262,49 +405,38 @@ torch.cuda.synchronize()
 print("[FreezeV2-Re] PointNet2 version:", __version__)
 print("[FreezeV2-Re] PointNet2 extension:", pointnet2_ops._ext.__file__)
 print("[FreezeV2-Re] PointNet2 CUDA smoke:", tuple(idx.shape), idx.device)
-if __version__ != "3.0.0":
-    raise SystemExit(f"unexpected PointNet2 version: {__version__}")
 PY
 
-# End-to-end smoke: use official GeDi Python/network code and checkpoint while
-# the installed wheel supplies only the matching prebuilt PointNet2 backend.
+# End-to-end smoke through the project adapter. This uses the official pinned
+# GeDi network and checkpoint, the freshly verified PointNet2 CUDA extension,
+# and freezev2's ABI-free CPU radius search.
 python - "$GEDI_ROOT" "$GEDI_CHECKPOINT_CANONICAL" <<'PY'
-import sys
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
 
+from freezev2.gedi_bridge import GediExtractor
+
 root = Path(sys.argv[1]).resolve()
-checkpoint = str(Path(sys.argv[2]).resolve())
-sys.path.insert(0, str(root))
-
-import open3d.ml.torch as ml3d
-from gedi import GeDi
-
+checkpoint = Path(sys.argv[2]).resolve()
 np.random.seed(0)
 torch.manual_seed(0)
 
-config = {
-    "dim": 32,
-    "samples_per_batch": 2,
-    "samples_per_patch_lrf": 512,
-    "samples_per_patch_out": 512,
-    "r_lrf": 0.5,
-    "fchkpt_gedi_net": checkpoint,
-}
+pcd = torch.rand(600, 3, dtype=torch.float32).numpy() * 0.1
+pts = pcd[:2].copy()
+extractor = GediExtractor(
+    checkpoint=checkpoint,
+    gedi_root=root,
+    seed=0,
+)
+desc = extractor.encode(pts, pcd, object_diameter=1.0)
 
-pcd = torch.rand(600, 3, dtype=torch.float32) * 0.1
-pts = pcd[:2].clone()
-gedi = GeDi(config=config)
-desc = gedi.compute(pts=pts, pcd=pcd)
-
-print("[FreezeV2-Re] GeDi radius_search:", ml3d.ops.radius_search)
 print("[FreezeV2-Re] GeDi descriptor smoke:", desc.shape, desc.dtype)
 print("[FreezeV2-Re] GeDi descriptor finite:", bool(np.isfinite(desc).all()))
-
-if desc.shape != (2, 32) or not np.isfinite(desc).all():
+if desc.shape != (2, 64) or not np.isfinite(desc).all():
     raise SystemExit("GeDi end-to-end descriptor smoke failed")
 PY
 
-echo "[FreezeV2-Re] GeDi prebuilt-only dependencies are ready in freeze."
+echo "[FreezeV2-Re] GeDi dependencies are ready for $PROFILE / sm_${POINTNET_ARCH/./}."
