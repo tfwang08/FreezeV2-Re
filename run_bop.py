@@ -27,6 +27,8 @@ from freezev2.onboard import load_onboarding_templates
 from freezev2.pipeline import estimate_pose_from_features
 from freezev2.query_features import aggregate_query_visual_features_streaming
 from freezev2.refinement import refine_pose_cache
+from freezev2.target_cli import extract_target_cache
+from freezev2.target_features import target_patch_grid as _target_patch_grid
 
 
 def _sample_mask_patch_centers(
@@ -254,6 +256,15 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "extract-target":
+        report = extract_target_cache(
+            args,
+            dino_cls=DinoExtractor,
+            gedi_cls=GediExtractor,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
         return
 
     if args.command == "refine-pose":
