@@ -191,9 +191,8 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         np.testing.assert_allclose(visual[:, 0], np.arange(256, dtype=np.float32))
         np.testing.assert_allclose(sparse_points[:, 2], 100.0)
         np.testing.assert_allclose(dense_points[:, 2], 100.0)
-        expected_cv = sparse_image_xy - 0.5
-        np.testing.assert_allclose(sparse_points[:, 0], expected_cv[:, 0] - 32.0)
-        np.testing.assert_allclose(sparse_points[:, 1], expected_cv[:, 1] - 32.0)
+        np.testing.assert_allclose(sparse_points[:, 0], sparse_image_xy[:, 0] - 32.0)
+        np.testing.assert_allclose(sparse_points[:, 1], sparse_image_xy[:, 1] - 32.0)
         np.testing.assert_allclose(np.linalg.norm(target[:, :64], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(np.linalg.norm(target[:, 64:], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(float(data["depth_scale"]), 0.1, atol=1e-7)
