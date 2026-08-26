@@ -136,7 +136,7 @@ def test_fuse_query_features_saves_128d_and_query_pca(tmp_path, monkeypatch):
         assert np.isfinite(fused).all()
 
 
-def test_extract_query_visual_saves_streamed_dino_cache(tmp_path, monkeypatch):
+def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatch):
     points = np.arange(18, dtype=np.float32).reshape(6, 3)
     onboarding = tmp_path / "onboarding.npz"
     np.savez_compressed(onboarding, query_points=points)
@@ -156,22 +156,25 @@ def test_extract_query_visual_saves_streamed_dino_cache(tmp_path, monkeypatch):
         calls["templates"] = (Path(cache_path), Path(images))
         return templates
 
-    def fake_aggregate(
+    def fail_legacy(*_args, **_kwargs):
+        raise AssertionError("query visual extraction must not use legacy projection aggregation")
+
+    def fake_pixel_aggregate(
         query_points,
         loaded_templates,
         extractor,
-        depth_tolerance,
         min_views=18,
-        view_weights=None,
-        depth_sampling="inverse_bilinear",
+        pixel_chunk_size=4096,
     ):
         np.testing.assert_array_equal(query_points, points)
         assert loaded_templates is templates
         assert isinstance(extractor, FakeDinoExtractor)
-        calls["aggregate"] = (depth_tolerance, min_views, view_weights, depth_sampling)
-        visual = np.arange(len(points) * 12, dtype=np.float32).reshape(len(points), 12)
+        calls["aggregate"] = (min_views, pixel_chunk_size)
+        uniform = np.arange(len(points) * 12, dtype=np.float32).reshape(len(points), 12)
+        pixel_support = uniform + 1000.0
         counts = np.full(len(points), 21, dtype=np.int32)
-        return points.copy(), visual, counts
+        pixel_counts = np.full(len(points), 321, dtype=np.int64)
+        return points.copy(), uniform, pixel_support, counts, pixel_counts
 
     monkeypatch.setattr(run_bop, "DinoExtractor", FakeDinoExtractor, raising=False)
     monkeypatch.setattr(
@@ -183,7 +186,13 @@ def test_extract_query_visual_saves_streamed_dino_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         run_bop,
         "aggregate_query_visual_features_streaming",
-        fake_aggregate,
+        fail_legacy,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        run_bop,
+        "aggregate_query_visual_features_pixel_lifting_streaming",
+        fake_pixel_aggregate,
         raising=False,
     )
     monkeypatch.setattr(sys, "argv", [
@@ -211,13 +220,22 @@ def test_extract_query_visual_saves_streamed_dino_cache(tmp_path, monkeypatch):
 
     assert calls["dino"] == ("cuda", 30, "token", dinov2_root)
     assert calls["templates"] == (onboarding, rgb_dir)
-    assert calls["aggregate"] == (1.0, 18, None, "inverse_bilinear")
+    assert calls["aggregate"] == (18, 4096)
     with np.load(output, allow_pickle=False) as data:
         assert data["query_points"].shape == (6, 3)
         assert data["visual_features"].shape == (6, 12)
+        np.testing.assert_array_equal(
+            data["visual_features"], data["visual_features_view_uniform"]
+        )
+        np.testing.assert_allclose(
+            data["visual_features_pixel_support"],
+            data["visual_features"] + 1000.0,
+        )
         np.testing.assert_array_equal(data["view_counts"], np.full(6, 21))
+        np.testing.assert_array_equal(data["pixel_support_counts"], np.full(6, 321))
+        assert str(np.asarray(data["visual_aggregation"]).item()) == "pixel_lift_nn_view_uniform"
+        assert str(np.asarray(data["visual_weighting_candidate"]).item()) == "pixel_support"
         assert int(data["dino_layer"]) == 30
         assert str(data["dino_facet"]) == "token"
-        assert float(data["depth_tolerance"]) == 1.0
+        assert float(data["legacy_depth_tolerance"]) == 1.0
         assert int(data["min_views"]) == 18
-        assert str(data["depth_sampling"]) == "inverse_bilinear"
