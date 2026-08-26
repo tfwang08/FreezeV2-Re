@@ -35,6 +35,50 @@ def _normalize(x: np.ndarray) -> np.ndarray:
     return x / np.clip(np.linalg.norm(x, axis=1, keepdims=True), 1e-12, None)
 
 
+def _triplet_edges_compatible(
+    source: np.ndarray,
+    target: np.ndarray,
+    tolerance: float,
+) -> bool:
+    """Reject a 3D-3D correspondence triplet with inconsistent edge lengths.
+
+    A rigid transform preserves the three pairwise distances of a triplet. The
+    FreeZeV2 paper describes a fast relative edge-length pruning step but does
+    not publish a separate numeric pruning constant. The caller therefore
+    supplies an explicit absolute tolerance in the same 3D units as the point
+    clouds; the pipeline defaults it to the published 0.03*diameter inlier
+    threshold so no hidden constant is introduced.
+    """
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    tolerance = float(tolerance)
+    if source.shape != (3, 3) or target.shape != (3, 3):
+        raise ValueError("source and target triplets must each have shape 3x3")
+    if tolerance <= 0 or not np.isfinite(tolerance):
+        raise ValueError("tolerance must be positive and finite")
+    pairs = ((0, 1), (0, 2), (1, 2))
+    source_edges = np.asarray([
+        np.linalg.norm(source[a] - source[b]) for a, b in pairs
+    ])
+    target_edges = np.asarray([
+        np.linalg.norm(target[a] - target[b]) for a, b in pairs
+    ])
+    return bool(np.all(np.abs(source_edges - target_edges) <= tolerance))
+
+
+def _inlier_mask(
+    pose: np.ndarray,
+    query_points: np.ndarray,
+    target_points: np.ndarray,
+    candidate_query_indices: np.ndarray,
+    inlier_threshold: float,
+) -> np.ndarray:
+    cand_pts = query_points[candidate_query_indices]
+    transformed = cand_pts @ pose[:3, :3].T + pose[:3, 3]
+    dist = np.linalg.norm(transformed - target_points[:, None, :], axis=2)
+    return dist < float(inlier_threshold)
+
+
 def _score_hypothesis(pose, query_points, query_features, target_points, target_features,
                       candidate_query_indices, inlier_threshold: float) -> float:
     """FreeZeV2 Eq. (5) feature-aware coarse-pose score.
@@ -45,21 +89,33 @@ def _score_hypothesis(pose, query_points, query_features, target_points, target_
     correspondences. Consequently the score can be larger than 1 when several
     candidates for a target point are geometric inliers.
     """
-    cand_pts = query_points[candidate_query_indices]
-    transformed = cand_pts @ pose[:3, :3].T + pose[:3, 3]
-    dist = np.linalg.norm(transformed - target_points[:, None, :], axis=2)
+    inliers = _inlier_mask(
+        pose,
+        query_points,
+        target_points,
+        candidate_query_indices,
+        inlier_threshold,
+    )
     qf = query_features[candidate_query_indices]
     tf = target_features[:, None, :]
     cosine = np.sum(qf * tf, axis=2)
-    inliers = dist < float(inlier_threshold)
     return float(np.sum(cosine[inliers]) / len(target_points))
 
 
 def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
                          target_points: np.ndarray, target_features: np.ndarray,
                          candidate_query_indices: np.ndarray, inlier_threshold: float,
-                         iterations: int = 10_000, seed: int = 0) -> tuple[np.ndarray, float]:
-    """FreeZeV2-style feature-aware 3D-3D RANSAC."""
+                         iterations: int = 10_000, seed: int = 0,
+                         edge_tolerance: float | None = None,
+                         return_debug: bool = False):
+    """FreeZeV2-style feature-aware 3D-3D RANSAC.
+
+    By default the published inlier threshold is also used for triplet
+    edge-length pruning because the paper does not report a separate numeric
+    pruning constant. Set ``edge_tolerance`` explicitly to study that
+    reverse-engineering choice. ``return_debug=True`` appends a dictionary with
+    the winning sampled correspondences and inlier statistics.
+    """
     qp = np.asarray(query_points, dtype=np.float64)
     tp = np.asarray(target_points, dtype=np.float64)
     qi = np.asarray(candidate_query_indices, dtype=np.int64)
@@ -69,32 +125,92 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
         raise ValueError("need at least 3 target points and one candidate row per target")
     if qi.ndim != 2 or qi.shape[1] == 0:
         raise ValueError("candidate_query_indices must have shape NxK with K > 0")
+    if np.any(qi < 0) or np.any(qi >= len(qp)):
+        raise ValueError("candidate_query_indices contains an out-of-range query index")
     if int(iterations) <= 0:
         raise ValueError("iterations must be positive")
     if float(inlier_threshold) <= 0:
         raise ValueError("inlier_threshold must be positive")
+    if edge_tolerance is None:
+        edge_tolerance = float(inlier_threshold)
+    edge_tolerance = float(edge_tolerance)
+    if edge_tolerance <= 0 or not np.isfinite(edge_tolerance):
+        raise ValueError("edge_tolerance must be positive and finite")
+
     rng = np.random.default_rng(seed)
     best_pose = np.eye(4, dtype=np.float64)
     best_score = -np.inf
+    best_target_indices = np.empty(0, dtype=np.int64)
+    best_candidate_columns = np.empty(0, dtype=np.int64)
+    best_query_indices = np.empty(0, dtype=np.int64)
     k = qi.shape[1]
+    degenerate_triplets = 0
+    edge_pruned_triplets = 0
+    valid_hypotheses = 0
+
     for _ in range(int(iterations)):
         ti = rng.choice(len(tp), size=3, replace=False)
         ci = rng.integers(0, k, size=3)
         qids = qi[ti, ci]
         src = qp[qids]
+        dst = tp[ti]
         if len(np.unique(qids)) < 3:
+            degenerate_triplets += 1
             continue
-        if np.linalg.matrix_rank(src[1:] - src[:1]) < 2 or np.linalg.matrix_rank(tp[ti][1:] - tp[ti][:1]) < 2:
+        if (
+            np.linalg.matrix_rank(src[1:] - src[:1]) < 2
+            or np.linalg.matrix_rank(dst[1:] - dst[:1]) < 2
+        ):
+            degenerate_triplets += 1
+            continue
+        if not _triplet_edges_compatible(src, dst, edge_tolerance):
+            edge_pruned_triplets += 1
             continue
         try:
-            R, t = kabsch(src, tp[ti])
+            R, t = kabsch(src, dst)
         except np.linalg.LinAlgError:
+            degenerate_triplets += 1
             continue
         pose = np.eye(4, dtype=np.float64)
         pose[:3, :3] = R
         pose[:3, 3] = t
+        valid_hypotheses += 1
         score = _score_hypothesis(pose, qp, qf, tp, tf, qi, inlier_threshold)
         if score > best_score:
             best_score = score
             best_pose = pose
-    return best_pose, float(best_score)
+            best_target_indices = np.asarray(ti, dtype=np.int64).copy()
+            best_candidate_columns = np.asarray(ci, dtype=np.int64).copy()
+            best_query_indices = np.asarray(qids, dtype=np.int64).copy()
+
+    if np.isfinite(best_score):
+        winning_inliers = _inlier_mask(
+            best_pose,
+            qp,
+            tp,
+            qi,
+            inlier_threshold,
+        )
+        inlier_count = int(winning_inliers.sum())
+        inlier_target_count = int(np.any(winning_inliers, axis=1).sum())
+    else:
+        inlier_count = 0
+        inlier_target_count = 0
+
+    if not return_debug:
+        return best_pose, float(best_score)
+
+    debug = {
+        "winning_target_indices": best_target_indices,
+        "winning_candidate_columns": best_candidate_columns,
+        "winning_query_indices": best_query_indices,
+        "inlier_count": inlier_count,
+        "inlier_target_count": inlier_target_count,
+        "edge_tolerance": edge_tolerance,
+        "degenerate_triplets": int(degenerate_triplets),
+        "edge_pruned_triplets": int(edge_pruned_triplets),
+        "valid_hypotheses": int(valid_hypotheses),
+        "iterations": int(iterations),
+        "seed": int(seed),
+    }
+    return best_pose, float(best_score), debug
