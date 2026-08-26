@@ -37,16 +37,22 @@ def _normalize(x: np.ndarray) -> np.ndarray:
 
 def _score_hypothesis(pose, query_points, query_features, target_points, target_features,
                       candidate_query_indices, inlier_threshold: float) -> float:
+    """FreeZeV2 Eq. (5) feature-aware coarse-pose score.
+
+    Every top-k correspondence whose transformed query point is inside the
+    geometric inlier threshold contributes its cosine similarity. The total is
+    normalized by the number of sparse target points, not by the number of
+    correspondences. Consequently the score can be larger than 1 when several
+    candidates for a target point are geometric inliers.
+    """
     cand_pts = query_points[candidate_query_indices]
     transformed = cand_pts @ pose[:3, :3].T + pose[:3, 3]
     dist = np.linalg.norm(transformed - target_points[:, None, :], axis=2)
     qf = query_features[candidate_query_indices]
     tf = target_features[:, None, :]
     cosine = np.sum(qf * tf, axis=2)
-    weighted = np.where(dist < inlier_threshold, cosine, -np.inf)
-    best = np.max(weighted, axis=1)
-    best[~np.isfinite(best)] = 0.0
-    return float(np.sum(np.clip(best, 0.0, None)) / len(target_points))
+    inliers = dist < float(inlier_threshold)
+    return float(np.sum(cosine[inliers]) / len(target_points))
 
 
 def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
@@ -61,9 +67,15 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
     tf = _normalize(target_features)
     if len(tp) < 3 or qi.shape[0] != len(tp):
         raise ValueError("need at least 3 target points and one candidate row per target")
+    if qi.ndim != 2 or qi.shape[1] == 0:
+        raise ValueError("candidate_query_indices must have shape NxK with K > 0")
+    if int(iterations) <= 0:
+        raise ValueError("iterations must be positive")
+    if float(inlier_threshold) <= 0:
+        raise ValueError("inlier_threshold must be positive")
     rng = np.random.default_rng(seed)
     best_pose = np.eye(4, dtype=np.float64)
-    best_score = -1.0
+    best_score = -np.inf
     k = qi.shape[1]
     for _ in range(int(iterations)):
         ti = rng.choice(len(tp), size=3, replace=False)
@@ -85,6 +97,4 @@ def feature_aware_ransac(query_points: np.ndarray, query_features: np.ndarray,
         if score > best_score:
             best_score = score
             best_pose = pose
-            if best_score >= 1.0 - 1e-12:
-                break
-    return best_pose, best_score
+    return best_pose, float(best_score)
