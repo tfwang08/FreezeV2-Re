@@ -25,6 +25,11 @@ from freezev2.geometry import backproject_depth
 from freezev2.matching import topk_cosine_matches
 from freezev2.onboard import load_onboarding_templates
 from freezev2.pipeline import estimate_pose_from_features
+from freezev2.query_crop import (
+    QUERY_DINO_INPUT_SIZE,
+    QUERY_DINO_MODE,
+    QUERY_DINO_PATCH_GRID,
+)
 from freezev2.query_features import (
     aggregate_query_visual_features_pixel_lifting_streaming,
     aggregate_query_visual_features_streaming,
@@ -982,8 +987,15 @@ def main() -> None:
             visual_features_pixel_support=visual_pixel_support,
             view_counts=view_counts,
             pixel_support_counts=pixel_support_counts,
-            visual_aggregation=np.array("pixel_lift_nn_view_uniform"),
+            visual_aggregation=np.array("tight_crop_224_pixel_lift_nn_view_uniform"),
             visual_weighting_candidate=np.array("pixel_support"),
+            query_dino_mode=np.array(QUERY_DINO_MODE),
+            query_dino_input_hw=np.asarray(
+                [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE], dtype=np.int32
+            ),
+            query_dino_patch_grid=np.asarray(
+                [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID], dtype=np.int32
+            ),
             dino_layer=np.int32(args.layer),
             dino_facet=np.array(args.facet),
             dino_model=np.array(DINOV2_MODEL_NAME),
@@ -1014,8 +1026,11 @@ def main() -> None:
                 int(pixel_support_counts.min()) if len(pixel_support_counts) else 0,
                 int(pixel_support_counts.max()) if len(pixel_support_counts) else 0,
             ],
-            "visual_aggregation": "pixel_lift_nn_view_uniform",
+            "visual_aggregation": "tight_crop_224_pixel_lift_nn_view_uniform",
             "visual_weighting_candidate": "pixel_support",
+            "query_dino_mode": QUERY_DINO_MODE,
+            "query_dino_input_hw": [QUERY_DINO_INPUT_SIZE, QUERY_DINO_INPUT_SIZE],
+            "query_dino_patch_grid": [QUERY_DINO_PATCH_GRID, QUERY_DINO_PATCH_GRID],
             "min_views": args.min_views,
             "legacy_depth_tolerance": args.depth_tolerance,
             "legacy_depth_sampling": args.depth_sampling,
@@ -1130,6 +1145,9 @@ def main() -> None:
                 "pixel_support_counts",
                 "visual_aggregation",
                 "visual_weighting_candidate",
+                "query_dino_mode",
+                "query_dino_input_hw",
+                "query_dino_patch_grid",
                 "dino_layer",
                 "dino_facet",
                 "dino_model",
