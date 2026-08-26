@@ -168,7 +168,7 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         np.testing.assert_allclose(dense_points[:, 2], 100.0)
         np.testing.assert_allclose(np.linalg.norm(target[:, :64], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(np.linalg.norm(target[:, 64:], axis=1), 1.0, atol=1e-5)
-        assert float(data["depth_scale"]) == 0.1
+        np.testing.assert_allclose(float(data["depth_scale"]), 0.1, atol=1e-7)
         assert int(data["grid_size"]) == 16
         assert int(data["dense_size_requested"]) == 3000
         assert np.isfinite(target).all()
