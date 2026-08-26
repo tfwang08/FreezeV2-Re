@@ -6,6 +6,7 @@ from freezev2.pose import (
     _score_hypothesis,
     _triplet_edges_compatible,
     feature_aware_ransac,
+    point_to_point_icp,
     sparse_grid_pixels,
 )
 from freezev2.pipeline import estimate_pose_from_features
@@ -133,6 +134,45 @@ def test_feature_aware_ransac_returns_winning_diagnostics():
     assert debug["winning_candidate_columns"].shape == (3,)
     assert debug["winning_query_indices"].shape == (3,)
     np.testing.assert_allclose(debug["edge_similarity_threshold"], 0.9)
+
+
+def test_point_to_point_icp_refines_known_pose_and_reports_inlier_ratio():
+    query_points = np.array([
+        [-20.0, -10.0, 0.0],
+        [15.0, -12.0, 4.0],
+        [-8.0, 20.0, 7.0],
+        [18.0, 16.0, -5.0],
+        [0.0, 0.0, 15.0],
+        [-15.0, 8.0, 22.0],
+        [12.0, -18.0, 20.0],
+    ])
+    angle = np.deg2rad(6.0)
+    R = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    t = np.array([80.0, -40.0, 600.0])
+    dense_target = query_points @ R.T + t
+
+    initial_pose = np.eye(4, dtype=np.float64)
+    initial_pose[:3, :3] = R
+    initial_pose[:3, 3] = t + np.array([1.2, -0.8, 0.6])
+
+    refined, icp_score, debug = point_to_point_icp(
+        query_points,
+        dense_target,
+        initial_pose,
+        max_correspondence_distance=3.0,
+        max_iterations=10,
+    )
+
+    np.testing.assert_allclose(refined[:3, :3], R, atol=1e-8)
+    np.testing.assert_allclose(refined[:3, 3], t, atol=1e-8)
+    np.testing.assert_allclose(icp_score, 1.0, atol=1e-12)
+    assert debug["inlier_count"] == len(query_points)
+    assert 1 <= debug["iterations_run"] <= 10
+    assert debug["rmse"] < 1e-8
 
 
 def test_feature_aware_pipeline_recovers_pose():
