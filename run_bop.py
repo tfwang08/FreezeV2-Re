@@ -13,8 +13,15 @@ from freezev2.bop import (
     evaluate_reference,
     prepare_bop_dataset,
 )
+from freezev2.features import (
+    DINOV2_FOUNDPOSE_COMMIT,
+    DINOV2_MODEL_NAME,
+    DinoExtractor,
+)
 from freezev2.fusion import fit_visual_pca, fuse_visual_geometric
 from freezev2.gedi_bridge import GEDI_REPO_COMMIT, GEDI_SCALES, GediExtractor
+from freezev2.onboard import load_onboarding_templates
+from freezev2.query_features import aggregate_query_visual_features_streaming
 
 
 def main() -> None:
@@ -37,6 +44,27 @@ def main() -> None:
     evaluate.add_argument("--bop-toolkit", type=Path, default=Path("external/bop_toolkit"))
     evaluate.add_argument("--eval-root", type=Path, default=Path("outputs/bop_eval"))
     evaluate.add_argument("--num-workers", type=int, default=10)
+
+    visual = subparsers.add_parser(
+        "extract-query-visual",
+        help="Aggregate frozen DINOv2 template features onto onboarded query points",
+    )
+    visual.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    visual.add_argument("--obj-id", type=int, required=True)
+    visual.add_argument("--layer", type=int, required=True)
+    visual.add_argument("--depth-tolerance", type=float, required=True)
+    visual.add_argument("--device", default="cuda")
+    visual.add_argument("--facet", default="token", choices=["token"])
+    visual.add_argument("--min-views", type=int, default=18)
+    visual.add_argument(
+        "--depth-sampling",
+        default="inverse_bilinear",
+        choices=["nearest", "bilinear", "inverse_bilinear"],
+    )
+    visual.add_argument("--onboarding-cache", type=Path)
+    visual.add_argument("--rgb-dir", type=Path)
+    visual.add_argument("--dinov2-root", type=Path, default=Path("external/dinov2"))
+    visual.add_argument("--output", type=Path)
 
     gedi = subparsers.add_parser(
         "extract-query-gedi",
@@ -77,6 +105,110 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "extract-query-visual":
+        if args.obj_id <= 0:
+            raise ValueError("--obj-id must be positive")
+        if args.layer < 0:
+            raise ValueError("--layer must be non-negative")
+        if args.depth_tolerance < 0:
+            raise ValueError("--depth-tolerance must be non-negative")
+        if args.min_views <= 0:
+            raise ValueError("--min-views must be positive")
+
+        stem = f"{args.dataset}_obj_{args.obj_id:06d}"
+        onboard_dir = Path("outputs/onboard") / stem
+        cache_path = args.onboarding_cache or (onboard_dir / "onboarding.npz")
+        rgb_dir = args.rgb_dir or (onboard_dir / "rgb")
+        output = args.output or (Path("outputs/features") / f"{stem}_visual.npz")
+
+        if not cache_path.is_file():
+            raise FileNotFoundError(f"onboarding cache not found: {cache_path}")
+        if not rgb_dir.is_dir():
+            raise FileNotFoundError(f"template RGB directory not found: {rgb_dir}")
+        if not args.dinov2_root.is_dir():
+            raise FileNotFoundError(
+                f"local DINOv2 checkout not found: {args.dinov2_root}"
+            )
+
+        with np.load(cache_path, allow_pickle=False) as cache:
+            if "query_points" not in cache:
+                raise KeyError(f"query_points missing from {cache_path}")
+            query_points = np.asarray(cache["query_points"], dtype=np.float32)
+        if query_points.ndim != 2 or query_points.shape[1] != 3:
+            raise ValueError("onboarding query_points must have shape Nx3")
+
+        templates = load_onboarding_templates(cache_path, rgb_dir)
+        extractor = DinoExtractor(
+            device=args.device,
+            layer=args.layer,
+            facet=args.facet,
+            repo_or_dir=args.dinov2_root,
+        )
+        kept_points, visual_features, view_counts = (
+            aggregate_query_visual_features_streaming(
+                query_points,
+                templates,
+                extractor,
+                depth_tolerance=args.depth_tolerance,
+                min_views=args.min_views,
+                view_weights=None,
+                depth_sampling=args.depth_sampling,
+            )
+        )
+        kept_points = np.asarray(kept_points, dtype=np.float32)
+        visual_features = np.asarray(visual_features, dtype=np.float32)
+        view_counts = np.asarray(view_counts, dtype=np.int32)
+
+        if kept_points.ndim != 2 or kept_points.shape[1] != 3:
+            raise RuntimeError(f"unexpected visual query-point shape: {kept_points.shape}")
+        if visual_features.ndim != 2 or len(visual_features) != len(kept_points):
+            raise RuntimeError(
+                f"unexpected query visual-feature shape: {visual_features.shape}"
+            )
+        if view_counts.shape != (len(kept_points),):
+            raise RuntimeError(f"unexpected view-count shape: {view_counts.shape}")
+        if not np.isfinite(visual_features).all():
+            raise RuntimeError("query visual features contain non-finite values")
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            query_points=kept_points,
+            visual_features=visual_features,
+            view_counts=view_counts,
+            dino_layer=np.int32(args.layer),
+            dino_facet=np.array(args.facet),
+            dino_model=np.array(DINOV2_MODEL_NAME),
+            dino_commit=np.array(DINOV2_FOUNDPOSE_COMMIT),
+            device=np.array(args.device),
+            min_views=np.int32(args.min_views),
+            depth_tolerance=np.float32(args.depth_tolerance),
+            depth_sampling=np.array(args.depth_sampling),
+            num_templates=np.int32(len(templates)),
+            input_query_count=np.int32(len(query_points)),
+            onboarding_source=np.array(str(cache_path)),
+            rgb_source=np.array(str(rgb_dir)),
+        )
+        print(json.dumps({
+            "dataset": args.dataset,
+            "obj_id": args.obj_id,
+            "dino_layer": args.layer,
+            "dino_model": DINOV2_MODEL_NAME,
+            "input_query_points": list(query_points.shape),
+            "retained_query_points": list(kept_points.shape),
+            "visual_features": list(visual_features.shape),
+            "view_count_range": [
+                int(view_counts.min()) if len(view_counts) else 0,
+                int(view_counts.max()) if len(view_counts) else 0,
+            ],
+            "min_views": args.min_views,
+            "depth_tolerance": args.depth_tolerance,
+            "depth_sampling": args.depth_sampling,
+            "finite": bool(np.isfinite(visual_features).all()),
+            "output": str(output),
+        }, indent=2, sort_keys=True))
         return
 
     if args.command == "extract-query-gedi":
@@ -176,7 +308,7 @@ def main() -> None:
             if args.visual_key not in data:
                 raise KeyError(f"{args.visual_key} missing from {visual_path}")
             points_visual = np.asarray(data[args.points_key], dtype=np.float32)
-            visual = np.asarray(data[args.visual_key], dtype=np.float32)
+            visual_features = np.asarray(data[args.visual_key], dtype=np.float32)
             for key in (
                 "view_counts",
                 "dino_layer",
@@ -215,9 +347,9 @@ def main() -> None:
             raise ValueError(
                 "visual and geometric caches do not describe the same points"
             )
-        if visual.ndim != 2 or geometric.ndim != 2:
+        if visual_features.ndim != 2 or geometric.ndim != 2:
             raise ValueError("visual and geometric features must have shape NxD")
-        if len(visual) != len(points_visual) or len(geometric) != len(points_visual):
+        if len(visual_features) != len(points_visual) or len(geometric) != len(points_visual):
             raise ValueError("feature caches and query points have inconsistent lengths")
         if args.pca_dim != geometric.shape[1]:
             raise ValueError(
@@ -225,8 +357,8 @@ def main() -> None:
                 f"({geometric.shape[1]})"
             )
 
-        pca = fit_visual_pca(visual, output_dim=args.pca_dim)
-        fused = fuse_visual_geometric(visual, geometric, pca)
+        pca = fit_visual_pca(visual_features, output_dim=args.pca_dim)
+        fused = fuse_visual_geometric(visual_features, geometric, pca)
         expected_shape = (len(points_visual), args.pca_dim + geometric.shape[1])
         if fused.shape != expected_shape:
             raise RuntimeError(f"unexpected fused query shape: {fused.shape}")
@@ -240,7 +372,7 @@ def main() -> None:
             "fused_features": fused,
             "pca_mean": pca.mean.astype(np.float32),
             "pca_components": pca.components.astype(np.float32),
-            "visual_dim": np.int32(visual.shape[1]),
+            "visual_dim": np.int32(visual_features.shape[1]),
             "geometric_dim": np.int32(geometric.shape[1]),
             "pca_dim": np.int32(args.pca_dim),
             "visual_source": np.array(str(visual_path)),
@@ -255,7 +387,7 @@ def main() -> None:
             "dataset": args.dataset,
             "obj_id": args.obj_id,
             "query_points": list(points_visual.shape),
-            "visual_features": list(visual.shape),
+            "visual_features": list(visual_features.shape),
             "geometric_features": list(geometric.shape),
             "pca_components": list(pca.components.shape),
             "fused_features": list(fused.shape),
