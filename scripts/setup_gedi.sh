@@ -7,10 +7,12 @@ set -eo pipefail
 # Blackwell (RTX 50-series, sm_120): Python 3.11 + PyTorch 2.7.1/CUDA 12.8.
 #
 # PointNet2 is built from the exact source vendored by the pinned GeDi commit
-# for the detected GPU architecture. This avoids opaque third-party wheels
-# whose embedded cubins may target a different GPU. GeDi's Open3D-ML radius
-# search is replaced in freezev2.gedi_bridge by an equivalent CPU torch search,
-# so the Blackwell profile is not blocked by Open3D 0.19's PyTorch-2.2 ABI.
+# for the detected GPU architecture. The matching CUDA compiler is installed
+# into an isolated toolkit prefix instead of the freeze conda environment, so
+# unrelated cuda-toolkit meta-packages cannot perturb dependency resolution.
+# GeDi's Open3D-ML radius search is replaced in freezev2.gedi_bridge by an
+# equivalent CPU torch search, so the Blackwell profile is not blocked by
+# Open3D 0.19's PyTorch-2.2 ABI.
 
 GEDI_COMMIT="b3dd86776750d8221f89d39975118da9839b39f7"
 GEDI_ROOT="${FREEZEV2_GEDI_ROOT:-external/gedi}"
@@ -91,7 +93,7 @@ _load_conda
 conda activate freeze
 
 GPU_CC="$(_detect_compute_capability)"
-read -r PROFILE PYTHON_MINOR TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION CUDA_TAG CUDA_VERSION POINTNET_ARCH < <(
+read -r PROFILE PYTHON_MINOR TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION CUDA_TAG CUDA_VERSION CUDA_CONDA_LABEL POINTNET_ARCH < <(
     python - "$GPU_CC" <<'PY'
 import sys
 from freezev2.gpu_stack import resolve_gpu_profile
@@ -106,6 +108,7 @@ print(
     p.torchaudio_version,
     p.cuda_tag,
     p.cuda_version,
+    p.cuda_conda_label,
     p.pointnet_arch,
 )
 PY
@@ -116,7 +119,9 @@ TORCH_VERSION="${FREEZEV2_TORCH_VERSION:-$TORCH_VERSION}"
 TORCHVISION_VERSION="${FREEZEV2_TORCHVISION_VERSION:-$TORCHVISION_VERSION}"
 TORCHAUDIO_VERSION="${FREEZEV2_TORCHAUDIO_VERSION:-$TORCHAUDIO_VERSION}"
 CUDA_VERSION="${FREEZEV2_CUDA_VERSION:-$CUDA_VERSION}"
+CUDA_CONDA_LABEL="${FREEZEV2_CUDA_CONDA_LABEL:-$CUDA_CONDA_LABEL}"
 POINTNET_ARCH="${FREEZEV2_POINTNET_ARCH:-$POINTNET_ARCH}"
+CUDA_TOOLKIT_PREFIX="${FREEZEV2_CUDA_TOOLKIT_PREFIX:-$HOME/.cache/freezev2/cuda-toolkits/$CUDA_CONDA_LABEL}"
 
 if [[ -n "${FREEZEV2_PYTORCH_INDEX_URL:-}" ]]; then
     PYTORCH_INDEX_URL="$FREEZEV2_PYTORCH_INDEX_URL"
@@ -129,6 +134,8 @@ fi
 echo "[FreezeV2-Re] GPU compute capability: $GPU_CC"
 echo "[FreezeV2-Re] GeDi GPU profile: $PROFILE"
 echo "[FreezeV2-Re] PointNet2 target: sm_${POINTNET_ARCH/./}"
+echo "[FreezeV2-Re] CUDA compiler label: $CUDA_CONDA_LABEL"
+echo "[FreezeV2-Re] CUDA toolkit prefix: $CUDA_TOOLKIT_PREFIX"
 echo "[FreezeV2-Re] PyTorch index: $PYTORCH_INDEX_URL"
 echo "[FreezeV2-Re] PyPI index: $PIP_INDEX_URL"
 
@@ -281,33 +288,63 @@ if not isinstance(ckpt, dict) or "pnet_model_state_dict" not in ckpt:
 print("[FreezeV2-Re] GeDi checkpoint:", p)
 PY
 
-_nvcc_minor() {
-    nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1
+_nvcc_minor_at() {
+    "$1" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1
 }
 
 _prepare_cuda_toolkit() {
+    local nvcc_path=""
+    local current=""
+
     if [[ -n "${FREEZEV2_CUDA_HOME:-}" ]]; then
         export CUDA_HOME="$FREEZEV2_CUDA_HOME"
-        export PATH="$CUDA_HOME/bin:$PATH"
+        nvcc_path="$CUDA_HOME/bin/nvcc"
+        if [[ ! -x "$nvcc_path" ]]; then
+            echo "[FreezeV2-Re] STOP: FREEZEV2_CUDA_HOME has no executable bin/nvcc: $CUDA_HOME" >&2
+            return 3
+        fi
+        current="$(_nvcc_minor_at "$nvcc_path")"
+    else
+        nvcc_path="$CUDA_TOOLKIT_PREFIX/bin/nvcc"
+        if [[ -x "$nvcc_path" ]]; then
+            current="$(_nvcc_minor_at "$nvcc_path")"
+        fi
+
+        if [[ "$current" != "$CUDA_VERSION" ]]; then
+            echo "[FreezeV2-Re] preparing isolated CUDA $CUDA_VERSION compiler at $CUDA_TOOLKIT_PREFIX."
+            mkdir -p "$(dirname "$CUDA_TOOLKIT_PREFIX")"
+
+            if [[ -d "$CUDA_TOOLKIT_PREFIX/conda-meta" ]]; then
+                conda install -y -p "$CUDA_TOOLKIT_PREFIX" \
+                    --override-channels \
+                    -c "nvidia/label/$CUDA_CONDA_LABEL" \
+                    -c defaults \
+                    "cuda-nvcc=${CUDA_VERSION}.*" \
+                    "cuda-cudart-dev=${CUDA_VERSION}.*" \
+                    "cuda-cccl=${CUDA_VERSION}.*"
+            else
+                rm -rf "$CUDA_TOOLKIT_PREFIX"
+                conda create -y -p "$CUDA_TOOLKIT_PREFIX" \
+                    --override-channels \
+                    -c "nvidia/label/$CUDA_CONDA_LABEL" \
+                    -c defaults \
+                    "cuda-nvcc=${CUDA_VERSION}.*" \
+                    "cuda-cudart-dev=${CUDA_VERSION}.*" \
+                    "cuda-cccl=${CUDA_VERSION}.*"
+            fi
+
+            nvcc_path="$CUDA_TOOLKIT_PREFIX/bin/nvcc"
+            if [[ -x "$nvcc_path" ]]; then
+                current="$(_nvcc_minor_at "$nvcc_path")"
+            else
+                current=""
+            fi
+        fi
+
+        export CUDA_HOME="$CUDA_TOOLKIT_PREFIX"
     fi
 
-    local current=""
-    if command -v nvcc >/dev/null 2>&1; then
-        current="$(_nvcc_minor)"
-    fi
-
-    if [[ "$current" != "$CUDA_VERSION" ]]; then
-        echo "[FreezeV2-Re] installing CUDA $CUDA_VERSION compiler into the freeze conda env."
-        conda install -y -n freeze -c nvidia \
-            "cuda-nvcc=${CUDA_VERSION}.*" \
-            "cuda-cudart-dev=${CUDA_VERSION}.*" \
-            "cuda-cccl=${CUDA_VERSION}.*"
-        hash -r
-        conda activate freeze
-        export CUDA_HOME="$CONDA_PREFIX"
-        export PATH="$CUDA_HOME/bin:$PATH"
-        current="$(_nvcc_minor)"
-    fi
+    export PATH="$CUDA_HOME/bin:$PATH"
 
     if [[ "$current" != "$CUDA_VERSION" ]]; then
         echo "[FreezeV2-Re] STOP: nvcc $CUDA_VERSION is required to build PointNet2 for $PROFILE." >&2
@@ -316,7 +353,8 @@ _prepare_cuda_toolkit() {
         return 3
     fi
 
-    echo "[FreezeV2-Re] nvcc: $(command -v nvcc)"
+    echo "[FreezeV2-Re] CUDA_HOME: $CUDA_HOME"
+    echo "[FreezeV2-Re] nvcc: $CUDA_HOME/bin/nvcc"
     echo "[FreezeV2-Re] nvcc CUDA: $current"
 }
 
