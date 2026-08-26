@@ -136,7 +136,7 @@ def test_fuse_query_features_saves_128d_and_query_pca(tmp_path, monkeypatch):
         assert np.isfinite(fused).all()
 
 
-def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatch):
+def test_extract_query_visual_defaults_to_freezv2_3d_to_2d_sampling(tmp_path, monkeypatch):
     points = np.arange(18, dtype=np.float32).reshape(6, 3)
     onboarding = tmp_path / "onboarding.npz"
     np.savez_compressed(onboarding, query_points=points)
@@ -156,25 +156,26 @@ def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatc
         calls["templates"] = (Path(cache_path), Path(images))
         return templates
 
-    def fail_legacy(*_args, **_kwargs):
-        raise AssertionError("query visual extraction must not use legacy projection aggregation")
-
-    def fake_pixel_aggregate(
+    def fake_projection_aggregate(
         query_points,
         loaded_templates,
         extractor,
+        depth_tolerance,
         min_views=18,
-        pixel_chunk_size=4096,
+        view_weights=None,
+        depth_sampling="inverse_bilinear",
     ):
         np.testing.assert_array_equal(query_points, points)
         assert loaded_templates is templates
         assert isinstance(extractor, FakeDinoExtractor)
-        calls["aggregate"] = (min_views, pixel_chunk_size)
-        uniform = np.arange(len(points) * 12, dtype=np.float32).reshape(len(points), 12)
-        pixel_support = uniform + 1000.0
+        assert view_weights is None
+        calls["aggregate"] = (depth_tolerance, min_views, depth_sampling)
+        features = np.arange(len(points) * 12, dtype=np.float32).reshape(len(points), 12)
         counts = np.full(len(points), 21, dtype=np.int32)
-        pixel_counts = np.full(len(points), 321, dtype=np.int64)
-        return points.copy(), uniform, pixel_support, counts, pixel_counts
+        return points.copy(), features, counts
+
+    def fail_pixel_lifting(*_args, **_kwargs):
+        raise AssertionError("FreeZeV2 default query path must not use pixel lifting")
 
     monkeypatch.setattr(run_bop, "DinoExtractor", FakeDinoExtractor, raising=False)
     monkeypatch.setattr(
@@ -186,13 +187,13 @@ def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatc
     monkeypatch.setattr(
         run_bop,
         "aggregate_query_visual_features_streaming",
-        fail_legacy,
+        fake_projection_aggregate,
         raising=False,
     )
     monkeypatch.setattr(
         run_bop,
         "aggregate_query_visual_features_pixel_lifting_streaming",
-        fake_pixel_aggregate,
+        fail_pixel_lifting,
         raising=False,
     )
     monkeypatch.setattr(sys, "argv", [
@@ -220,25 +221,18 @@ def test_extract_query_visual_saves_pixel_lifted_dino_cache(tmp_path, monkeypatc
 
     assert calls["dino"] == ("cuda", 30, "token", dinov2_root)
     assert calls["templates"] == (onboarding, rgb_dir)
-    assert calls["aggregate"] == (18, 4096)
+    assert calls["aggregate"] == (1.0, 18, "inverse_bilinear")
     with np.load(output, allow_pickle=False) as data:
         assert data["query_points"].shape == (6, 3)
         assert data["visual_features"].shape == (6, 12)
-        np.testing.assert_array_equal(
-            data["visual_features"], data["visual_features_view_uniform"]
-        )
-        np.testing.assert_allclose(
-            data["visual_features_pixel_support"],
-            data["visual_features"] + 1000.0,
-        )
         np.testing.assert_array_equal(data["view_counts"], np.full(6, 21))
-        np.testing.assert_array_equal(data["pixel_support_counts"], np.full(6, 321))
-        assert str(np.asarray(data["visual_aggregation"]).item()) == "tight_crop_224_pixel_lift_nn_view_uniform"
-        assert str(np.asarray(data["visual_weighting_candidate"]).item()) == "pixel_support"
-        assert str(np.asarray(data["query_dino_mode"]).item()) == "tight_mask_crop_224_pixel_lift"
-        np.testing.assert_array_equal(data["query_dino_input_hw"], [224, 224])
-        np.testing.assert_array_equal(data["query_dino_patch_grid"], [16, 16])
+        assert str(np.asarray(data["visual_aggregation"]).item()) == (
+            "freezv2_3d_to_2d_visible_view_uniform"
+        )
+        assert str(np.asarray(data["query_sampling_mode"]).item()) == "3d_to_2d_projection"
+        assert str(np.asarray(data["query_visibility"]).item()) == "rendered_depth"
         assert int(data["dino_layer"]) == 30
         assert str(data["dino_facet"]) == "token"
-        assert float(data["legacy_depth_tolerance"]) == 1.0
+        assert float(data["depth_tolerance"]) == 1.0
+        assert str(np.asarray(data["depth_sampling"]).item()) == "inverse_bilinear"
         assert int(data["min_views"]) == 18
