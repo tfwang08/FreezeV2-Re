@@ -127,6 +127,16 @@ def main() -> None:
     visual.add_argument("--layer", type=int, required=True)
     visual.add_argument("--depth-tolerance", type=float, required=True)
     visual.add_argument("--device", default="cuda")
+    visual.add_argument(
+        "--dino-model",
+        default=DINOV2_MODEL_NAME,
+        choices=[DINOV2_MODEL_NAME, "dinov2_vitg14_reg"],
+        help=(
+            "DINOv2 giant backbone. The -reg variant is a FoundPose-faithful "
+            "A/B candidate; the paper does not explicitly publish whether "
+            "FreeZeV2 uses register tokens."
+        ),
+    )
     visual.add_argument("--facet", default="token", choices=["token"])
     visual.add_argument("--min-views", type=int, default=18)
     visual.add_argument(
@@ -928,6 +938,7 @@ def main() -> None:
             device=args.device,
             layer=args.layer,
             facet=args.facet,
+            model_name=args.dino_model,
             repo_or_dir=args.dinov2_root,
         )
         kept_points, visual_features, view_counts = (
@@ -967,7 +978,7 @@ def main() -> None:
             query_visibility=np.array("rendered_depth"),
             dino_layer=np.int32(args.layer),
             dino_facet=np.array(args.facet),
-            dino_model=np.array(DINOV2_MODEL_NAME),
+            dino_model=np.array(args.dino_model),
             dino_commit=np.array(DINOV2_FOUNDPOSE_COMMIT),
             device=np.array(args.device),
             min_views=np.int32(args.min_views),
@@ -982,7 +993,7 @@ def main() -> None:
             "dataset": args.dataset,
             "obj_id": args.obj_id,
             "dino_layer": args.layer,
-            "dino_model": DINOV2_MODEL_NAME,
+            "dino_model": args.dino_model,
             "input_query_points": list(query_points.shape),
             "retained_query_points": list(kept_points.shape),
             "visual_features": list(visual_features.shape),
