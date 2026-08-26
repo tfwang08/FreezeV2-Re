@@ -12,6 +12,7 @@ class GPUProfile:
     torchaudio_version: str
     cuda_tag: str
     cuda_version: str
+    cuda_conda_label: str
     pointnet_arch: str
 
 
@@ -27,6 +28,7 @@ def resolve_gpu_profile(capability: tuple[int, int]) -> GPUProfile:
             torchaudio_version="2.2.2",
             cuda_tag="cu121",
             cuda_version="12.1",
+            cuda_conda_label="cuda-12.1.1",
             pointnet_arch="8.0",
         )
     if (major, minor) == (12, 0):
@@ -38,6 +40,7 @@ def resolve_gpu_profile(capability: tuple[int, int]) -> GPUProfile:
             torchaudio_version="2.7.1",
             cuda_tag="cu128",
             cuda_version="12.8",
+            cuda_conda_label="cuda-12.8.1",
             pointnet_arch="12.0",
         )
     raise ValueError(
