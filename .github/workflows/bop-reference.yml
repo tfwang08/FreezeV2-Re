@@ -9,11 +9,16 @@ on:
       - "freezev2/geometry.py"
       - "freezev2/onboard.py"
       - "freezev2/gedi_bridge.py"
+      - "freezev2/gedi_radius.py"
+      - "freezev2/gpu_stack.py"
+      - "scripts/setup_gedi.sh"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
       - "tests/test_onboard.py"
       - "tests/test_gedi_bridge.py"
+      - "tests/test_gedi_radius.py"
+      - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
   pull_request:
     branches: [main]
@@ -23,11 +28,16 @@ on:
       - "freezev2/geometry.py"
       - "freezev2/onboard.py"
       - "freezev2/gedi_bridge.py"
+      - "freezev2/gedi_radius.py"
+      - "freezev2/gpu_stack.py"
+      - "scripts/setup_gedi.sh"
       - "run_bop.py"
       - "pyproject.toml"
       - "tests/test_bop.py"
       - "tests/test_onboard.py"
       - "tests/test_gedi_bridge.py"
+      - "tests/test_gedi_radius.py"
+      - "tests/test_gpu_stack.py"
       - "tests/test_run_bop.py"
   workflow_dispatch:
 
