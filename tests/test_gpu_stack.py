@@ -10,6 +10,7 @@ def test_ampere_profile_keeps_reproduction_stack():
     assert profile.torch_version == "2.2.2"
     assert profile.cuda_tag == "cu121"
     assert profile.pointnet_arch == "8.0"
+    assert profile.cuda_conda_label == "cuda-12.1.1"
 
 
 def test_blackwell_profile_uses_cu128_and_sm120():
@@ -19,6 +20,7 @@ def test_blackwell_profile_uses_cu128_and_sm120():
     assert profile.torch_version == "2.7.1"
     assert profile.cuda_tag == "cu128"
     assert profile.pointnet_arch == "12.0"
+    assert profile.cuda_conda_label == "cuda-12.8.1"
 
 
 def test_unknown_gpu_profile_is_rejected():
