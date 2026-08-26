@@ -184,6 +184,14 @@ def main() -> None:
     target.add_argument("--seed", type=int, default=0)
     target.add_argument("--output", type=Path)
 
+    target_viz = subparsers.add_parser(
+        "visualize-target",
+        help="Overlay saved sparse target patch centers on their RGB/mask inputs",
+    )
+    target_viz.add_argument("--target-cache", type=Path, required=True)
+    target_viz.add_argument("--output", type=Path)
+    target_viz.add_argument("--radius", type=int, default=3)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -192,6 +200,99 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "visualize-target":
+        if args.radius <= 0:
+            raise ValueError("--radius must be positive")
+        if not args.target_cache.is_file():
+            raise FileNotFoundError(f"target cache not found: {args.target_cache}")
+
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError as exc:
+            raise RuntimeError("Install Pillow to visualize target caches") from exc
+
+        required = ("sparse_image_xy", "sparse_points", "rgb_source", "mask_source")
+        with np.load(args.target_cache, allow_pickle=False) as data:
+            missing = [key for key in required if key not in data]
+            if missing:
+                raise KeyError("target cache is missing: " + ", ".join(missing))
+            sparse_image_xy = np.asarray(data["sparse_image_xy"], dtype=np.float32)
+            sparse_points = np.asarray(data["sparse_points"], dtype=np.float32)
+            rgb_path = Path(str(np.asarray(data["rgb_source"]).item()))
+            mask_path = Path(str(np.asarray(data["mask_source"]).item()))
+
+        if sparse_image_xy.ndim != 2 or sparse_image_xy.shape[1] != 2:
+            raise ValueError("sparse_image_xy must have shape Nx2")
+        if sparse_points.shape != (len(sparse_image_xy), 3):
+            raise ValueError("sparse_points must have shape Nx3 matching sparse_image_xy")
+        if len(sparse_points) == 0:
+            raise ValueError("target cache contains no sparse points")
+        if not np.isfinite(sparse_image_xy).all() or not np.isfinite(sparse_points).all():
+            raise ValueError("target cache contains non-finite sparse coordinates")
+        if not rgb_path.is_file():
+            raise FileNotFoundError(f"RGB source not found: {rgb_path}")
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"mask source not found: {mask_path}")
+
+        rgb = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
+        mask_raw = np.asarray(Image.open(mask_path))
+        if mask_raw.ndim == 3:
+            mask = np.any(mask_raw != 0, axis=2)
+        else:
+            mask = mask_raw != 0
+        if mask.shape != rgb.shape[:2]:
+            raise ValueError("RGB and mask source sizes do not match")
+
+        overlay = rgb.astype(np.float32)
+        tint = np.array([0.0, 255.0, 0.0], dtype=np.float32)
+        overlay[mask] = 0.65 * overlay[mask] + 0.35 * tint
+        overlay_image = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8), mode="RGB")
+        draw = ImageDraw.Draw(overlay_image)
+        radius = float(args.radius)
+        for x, y in sparse_image_xy:
+            draw.ellipse(
+                (float(x) - radius, float(y) - radius, float(x) + radius, float(y) + radius),
+                fill=(255, 0, 0),
+                outline=(255, 255, 255),
+                width=1,
+            )
+
+        pixels = np.floor(sparse_image_xy).astype(np.int64)
+        h, w = mask.shape
+        inside_image = (
+            (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < w)
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < h)
+        )
+        inside_mask = np.zeros(len(pixels), dtype=bool)
+        ids = np.flatnonzero(inside_image)
+        if len(ids):
+            inside_mask[ids] = mask[pixels[ids, 1], pixels[ids, 0]]
+
+        output = args.output or args.target_cache.with_name(
+            f"{args.target_cache.stem}_overlay.png"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        overlay_image.save(output)
+
+        xyz_min = sparse_points.min(axis=0)
+        xyz_max = sparse_points.max(axis=0)
+        print(json.dumps({
+            "point_count": int(len(sparse_points)),
+            "inside_image_count": int(inside_image.sum()),
+            "inside_mask_count": int(inside_mask.sum()),
+            "inside_mask_fraction": float(inside_mask.mean()),
+            "xyz_min": [float(v) for v in xyz_min],
+            "xyz_max": [float(v) for v in xyz_max],
+            "z_range": [float(xyz_min[2]), float(xyz_max[2])],
+            "rgb_source": str(rgb_path),
+            "mask_source": str(mask_path),
+            "target_cache": str(args.target_cache),
+            "output": str(output),
+        }, indent=2, sort_keys=True))
         return
 
     if args.command == "extract-target":
