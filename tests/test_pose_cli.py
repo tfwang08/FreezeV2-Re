@@ -77,7 +77,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
         k=10,
         iterations=10_000,
         seed=0,
-        edge_tolerance=None,
+        edge_similarity_threshold=0.9,
         return_debug=False,
     ):
         np.testing.assert_array_equal(query_points_arg, query_points)
@@ -89,7 +89,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
             k,
             iterations,
             seed,
-            edge_tolerance,
+            edge_similarity_threshold,
             return_debug,
         )
         pose = np.eye(4, dtype=np.float64)
@@ -101,7 +101,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
             "winning_query_indices": np.array([0, 1, 2], dtype=np.int64),
             "inlier_count": 7,
             "inlier_target_count": 4,
-            "edge_tolerance": 3.0,
+            "edge_similarity_threshold": 0.9,
             "degenerate_triplets": 11,
             "edge_pruned_triplets": 23,
             "valid_hypotheses": 9966,
@@ -136,7 +136,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
     run_bop.main()
 
     assert calls["topk"] == ((4, 128), (12, 128), 10)
-    assert calls["estimate"] == (100.0, 10, 10_000, 0, 3.0, True)
+    assert calls["estimate"] == (100.0, 10, 10_000, 0, 0.9, True)
 
     with np.load(output, allow_pickle=False) as data:
         np.testing.assert_allclose(data["coarse_pose"], np.block([
@@ -147,7 +147,7 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
         np.testing.assert_allclose(data["candidate_similarities"], candidate_sim)
         assert float(data["coarse_score"]) == 2.75
         np.testing.assert_allclose(float(data["inlier_threshold"]), 3.0)
-        np.testing.assert_allclose(float(data["edge_tolerance"]), 3.0)
+        np.testing.assert_allclose(float(data["edge_similarity_threshold"]), 0.9)
         assert int(data["top_k"]) == 10
         assert int(data["iterations"]) == 10_000
         assert int(data["gt_id"]) == 0
@@ -171,6 +171,6 @@ def test_estimate_coarse_pose_uses_paper_defaults_and_gt_metrics(
     assert report["edge_pruned_triplets"] == 23
     assert report["valid_hypotheses"] == 9966
     np.testing.assert_allclose(report["inlier_threshold"], 3.0)
-    np.testing.assert_allclose(report["edge_tolerance"], 3.0)
+    np.testing.assert_allclose(report["edge_similarity_threshold"], 0.9)
     np.testing.assert_allclose(report["rotation_error_deg"], 0.0, atol=1e-10)
     np.testing.assert_allclose(report["translation_error_mm"], 0.0, atol=1e-10)
