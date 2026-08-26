@@ -14,20 +14,6 @@ run_bop = importlib.util.module_from_spec(_RUN_BOP_SPEC)
 _RUN_BOP_SPEC.loader.exec_module(run_bop)
 
 
-class _FakeSampled:
-    def __init__(self, array):
-        self.array = np.asarray(array, dtype=np.float32)
-
-    def detach(self):
-        return self
-
-    def to(self, *_args, **_kwargs):
-        return self
-
-    def numpy(self):
-        return self.array
-
-
 def test_mask_patch_centers_use_smallest_square_bbox():
     assert hasattr(run_bop, "_sample_mask_patch_centers")
 
@@ -47,6 +33,24 @@ def test_mask_patch_centers_use_smallest_square_bbox():
     np.testing.assert_allclose(np.unique(centers[:, 1]), [34.75, 45.25])
     np.testing.assert_array_equal(pixels, np.floor(centers).astype(np.int64))
     assert np.all(mask[pixels[:, 1], pixels[:, 0]])
+
+
+def test_target_patch_grid_preserves_direct_dino_token_indices():
+    assert hasattr(run_bop, "_target_patch_grid")
+
+    mask = np.ones((64, 64), dtype=bool)
+    centers, pixels, token_indices, bbox = run_bop._target_patch_grid(
+        mask,
+        grid_size=16,
+    )
+
+    assert centers.shape == (256, 2)
+    assert pixels.shape == (256, 2)
+    np.testing.assert_array_equal(token_indices, np.arange(256, dtype=np.int64))
+    np.testing.assert_allclose(bbox, [0.0, 0.0, 64.0, 64.0])
+    expected_axis = np.arange(2.0, 64.0, 4.0, dtype=np.float32)
+    np.testing.assert_allclose(np.unique(centers[:, 0]), expected_axis)
+    np.testing.assert_allclose(np.unique(centers[:, 1]), expected_axis)
 
 
 def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, monkeypatch):
@@ -99,14 +103,16 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
             calls["dino_init"] = (device, layer, facet, model_name, Path(repo_or_dir))
             self.last_image_hw = None
 
-        def compatible_image_hw(self, image_hw):
-            assert tuple(image_hw) == (64, 64)
-            return (64, 64)
-
         def encode(self, image):
-            calls["rgb_shape"] = tuple(np.asarray(image).shape)
-            self.last_image_hw = (64, 64)
-            return object()
+            crop = np.asarray(image)
+            calls["rgb_shape"] = tuple(crop.shape)
+            assert crop.shape == (224, 224, 3)
+            self.last_image_hw = (224, 224)
+            feature_map = np.empty((96, 16, 16), dtype=np.float32)
+            token_ids = np.arange(256, dtype=np.float32).reshape(16, 16)
+            for channel in range(96):
+                feature_map[channel] = token_ids + channel / 1000.0
+            return feature_map
 
     class FakeGediExtractor:
         def __init__(self, checkpoint, gedi_root, seed=0):
@@ -117,16 +123,12 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
             values = np.linspace(1.0, 2.0, 64, dtype=np.float32)
             return np.tile(values, (len(pts), 1))
 
-    def fake_sample_feature_map(_feature_map, pixels_xy, image_hw):
-        pixels_xy = np.asarray(pixels_xy, dtype=np.float32)
-        calls["sample_pixels"] = pixels_xy.copy()
-        calls["sample_hw"] = tuple(image_hw)
-        values = np.linspace(1.0, 2.0, 96, dtype=np.float32)
-        return _FakeSampled(np.tile(values, (len(pixels_xy), 1)))
+    def fail_if_interpolated(*_args, **_kwargs):
+        raise AssertionError("target DINO descriptors must use direct patch tokens")
 
     monkeypatch.setattr(run_bop, "DinoExtractor", FakeDinoExtractor, raising=False)
     monkeypatch.setattr(run_bop, "GediExtractor", FakeGediExtractor, raising=False)
-    monkeypatch.setattr(run_bop, "sample_feature_map", fake_sample_feature_map, raising=False)
+    monkeypatch.setattr(run_bop, "sample_feature_map", fail_if_interpolated, raising=False)
     monkeypatch.setattr(sys, "argv", [
         "run_bop.py",
         "extract-target",
@@ -165,31 +167,28 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         "dinov2_vitg14",
         dinov2_root,
     )
-    assert calls["rgb_shape"] == (64, 64, 3)
-    assert calls["sample_hw"] == (64, 64)
+    assert calls["rgb_shape"] == (224, 224, 3)
     assert calls["gedi_shapes"] == ((256, 3), (3000, 3), 100.0)
-
-    sampled = calls["sample_pixels"]
-    assert sampled.shape == (256, 2)
-    expected_axis = np.arange(2.0, 64.0, 4.0, dtype=np.float32)
-    np.testing.assert_allclose(np.unique(sampled[:, 0]), expected_axis)
-    np.testing.assert_allclose(np.unique(sampled[:, 1]), expected_axis)
 
     with np.load(output, allow_pickle=False) as data:
         sparse_pixels = np.asarray(data["sparse_pixels"])
         sparse_image_xy = np.asarray(data["sparse_image_xy"])
         sparse_points = np.asarray(data["sparse_points"])
         dense_points = np.asarray(data["dense_points"])
+        visual = np.asarray(data["visual_features"])
         target = np.asarray(data["target_features"])
         assert sparse_pixels.shape == (256, 2)
         assert sparse_image_xy.shape == (256, 2)
         assert sparse_points.shape == (256, 3)
         assert dense_points.shape == (3000, 3)
-        assert data["visual_features"].shape == (256, 96)
+        assert visual.shape == (256, 96)
         assert data["geometric_features"].shape == (256, 64)
         assert target.shape == (256, 128)
-        np.testing.assert_allclose(sparse_image_xy, sampled)
-        np.testing.assert_array_equal(sparse_pixels, np.floor(sampled).astype(np.int32))
+        expected_axis = np.arange(2.0, 64.0, 4.0, dtype=np.float32)
+        np.testing.assert_allclose(np.unique(sparse_image_xy[:, 0]), expected_axis)
+        np.testing.assert_allclose(np.unique(sparse_image_xy[:, 1]), expected_axis)
+        np.testing.assert_array_equal(sparse_pixels, np.floor(sparse_image_xy).astype(np.int32))
+        np.testing.assert_allclose(visual[:, 0], np.arange(256, dtype=np.float32))
         np.testing.assert_allclose(sparse_points[:, 2], 100.0)
         np.testing.assert_allclose(dense_points[:, 2], 100.0)
         expected_cv = sparse_image_xy - 0.5
@@ -198,6 +197,10 @@ def test_extract_target_builds_sparse_dense_and_128d_representation(tmp_path, mo
         np.testing.assert_allclose(np.linalg.norm(target[:, :64], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(np.linalg.norm(target[:, 64:], axis=1), 1.0, atol=1e-5)
         np.testing.assert_allclose(float(data["depth_scale"]), 0.1, atol=1e-7)
+        np.testing.assert_allclose(data["square_bbox_xyxy"], [0.0, 0.0, 64.0, 64.0])
+        np.testing.assert_array_equal(data["target_dino_input_hw"], [224, 224])
+        np.testing.assert_array_equal(data["target_dino_patch_grid"], [16, 16])
+        assert str(np.asarray(data["target_dino_mode"]).item()) == "square_crop_224_direct_tokens"
         assert int(data["grid_size"]) == 16
         assert int(data["dense_size_requested"]) == 3000
         assert np.isfinite(target).all()
