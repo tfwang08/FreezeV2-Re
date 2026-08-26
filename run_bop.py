@@ -26,6 +26,7 @@ from freezev2.matching import topk_cosine_matches
 from freezev2.onboard import load_onboarding_templates
 from freezev2.pipeline import estimate_pose_from_features
 from freezev2.query_features import aggregate_query_visual_features_streaming
+from freezev2.refinement import refine_pose_cache
 
 
 def _sample_mask_patch_centers(
@@ -228,6 +229,23 @@ def main() -> None:
     coarse.add_argument("--gt-id", type=int)
     coarse.add_argument("--output", type=Path)
 
+    refine = subparsers.add_parser(
+        "refine-pose",
+        help="Refine a saved coarse pose with dense target ICP and final scoring",
+    )
+    refine.add_argument("--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS))
+    refine.add_argument("--scene-id", type=int, required=True)
+    refine.add_argument("--im-id", type=int, required=True)
+    refine.add_argument("--obj-id", type=int, required=True)
+    refine.add_argument("--query-cache", type=Path)
+    refine.add_argument("--target-cache", type=Path, required=True)
+    refine.add_argument("--coarse-cache", type=Path)
+    refine.add_argument("--bop-root", type=Path, default=Path("data/bop"))
+    refine.add_argument("--split", default="test")
+    refine.add_argument("--icp-max-iterations", type=int, default=30)
+    refine.add_argument("--gt-id", type=int)
+    refine.add_argument("--output", type=Path)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -236,6 +254,24 @@ def main() -> None:
 
     if args.command == "download-reference":
         print(download_reference_submission(args.dataset, args.output_dir))
+        return
+
+    if args.command == "refine-pose":
+        report = refine_pose_cache(
+            dataset=args.dataset,
+            scene_id=args.scene_id,
+            im_id=args.im_id,
+            obj_id=args.obj_id,
+            query_cache=args.query_cache,
+            target_cache=args.target_cache,
+            coarse_cache=args.coarse_cache,
+            bop_root=args.bop_root,
+            split=args.split,
+            icp_max_iterations=args.icp_max_iterations,
+            gt_id=args.gt_id,
+            output=args.output,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
         return
 
     if args.command == "estimate-coarse-pose":
