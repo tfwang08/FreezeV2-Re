@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import sys
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from freezev2.bop import (
     download_reference_submission,
     evaluate_reference,
     prepare_bop_dataset,
+    write_bop_csv,
 )
 from freezev2.features import (
     DINOV2_FOUNDPOSE_COMMIT,
@@ -598,6 +600,197 @@ def _estimate_multi_mask(args) -> dict:
     return report
 
 
+def _run_localization(args) -> dict:
+    if args.max_images is not None and args.max_images <= 0:
+        raise ValueError("--max-images must be positive")
+    if args.nms_translation_threshold_mm <= 0 or not np.isfinite(
+        args.nms_translation_threshold_mm
+    ):
+        raise ValueError(
+            "--nms-translation-threshold-mm must be positive and finite"
+        )
+
+    targets_json = args.targets_json or (
+        args.bop_root / args.dataset / "test_targets_bop19.json"
+    )
+    targets_json = Path(targets_json)
+    if not targets_json.is_file():
+        raise FileNotFoundError(
+            f"BOP localization targets not found: {targets_json}"
+        )
+    targets = json.loads(targets_json.read_text())
+    if not isinstance(targets, list):
+        raise ValueError(f"BOP targets must contain a list: {targets_json}")
+
+    image_targets = {}
+    image_order = []
+    for index, target in enumerate(targets):
+        if not isinstance(target, dict):
+            raise ValueError(f"BOP target {index} is not an object")
+        missing = [
+            key
+            for key in ("scene_id", "im_id", "obj_id", "inst_count")
+            if key not in target
+        ]
+        if missing:
+            raise ValueError(
+                f"BOP target {index} is missing: {', '.join(missing)}"
+            )
+        scene_id = int(target["scene_id"])
+        im_id = int(target["im_id"])
+        obj_id = int(target["obj_id"])
+        inst_count = int(target["inst_count"])
+        if scene_id < 0 or im_id < 0 or obj_id <= 0 or inst_count < 0:
+            raise ValueError(f"BOP target {index} contains invalid ids/count")
+        key = (scene_id, im_id)
+        if key not in image_targets:
+            image_targets[key] = []
+            image_order.append(key)
+        image_targets[key].append({
+            "scene_id": scene_id,
+            "im_id": im_id,
+            "obj_id": obj_id,
+            "inst_count": inst_count,
+        })
+
+    if args.max_images is not None:
+        image_order = image_order[: int(args.max_images)]
+
+    work_dir = args.work_dir or (
+        Path("outputs/localization") / args.dataset
+    )
+    work_dir = Path(work_dir)
+    output = args.output or (
+        Path("outputs/submissions")
+        / f"freezev2-re_{args.dataset}-test.csv"
+    )
+    output = Path(output)
+    query_cache_dir = Path(args.query_cache_dir)
+
+    predictions = []
+    image_reports = []
+    processed_target_count = 0
+    for scene_id, im_id in image_order:
+        started = time.perf_counter()
+        image_predictions = []
+        target_reports = []
+        for target in image_targets[(scene_id, im_id)]:
+            obj_id = target["obj_id"]
+            processed_target_count += 1
+            query_cache = (
+                query_cache_dir
+                / f"{args.dataset}_obj_{obj_id:06d}_query.npz"
+            )
+            if not query_cache.is_file():
+                raise FileNotFoundError(
+                    f"query cache not found: {query_cache}"
+                )
+
+            target_work_dir = (
+                work_dir
+                / f"scene_{scene_id:06d}_im_{im_id:06d}_obj_{obj_id:06d}"
+            )
+            target_output = target_work_dir / "result.json"
+            argv = [
+                "estimate-multi-mask",
+                "--dataset", args.dataset,
+                "--scene-id", str(scene_id),
+                "--im-id", str(im_id),
+                "--obj-id", str(obj_id),
+                "--bop-root", str(args.bop_root),
+                "--split", args.split,
+                "--query-cache", str(query_cache),
+                "--targets-json", str(targets_json),
+                "--nms-translation-threshold-mm",
+                str(args.nms_translation_threshold_mm),
+                "--dinov2-root", str(args.dinov2_root),
+                "--gedi-root", str(args.gedi_root),
+                "--checkpoint", str(args.checkpoint),
+                "--device", args.device,
+                "--grid-size", str(args.grid_size),
+                "--dense-size", str(args.dense_size),
+                "--top-k", str(args.top_k),
+                "--iterations", str(args.iterations),
+                "--seed", str(args.seed),
+                "--edge-similarity-threshold",
+                str(args.edge_similarity_threshold),
+                "--icp-max-iterations", str(args.icp_max_iterations),
+                "--work-dir", str(target_work_dir),
+                "--output", str(target_output),
+            ]
+            for detection_json in args.detection_json or []:
+                argv += ["--detection-json", str(detection_json)]
+
+            target_report = _invoke_main_command(argv)
+            selected = target_report.get("selected", [])
+            if not isinstance(selected, list):
+                raise RuntimeError(
+                    "estimate-multi-mask returned invalid selected poses"
+                )
+            for pose_index, selected_pose in enumerate(selected):
+                R = np.asarray(selected_pose["R"], dtype=np.float64)
+                t = np.asarray(selected_pose["t_mm"], dtype=np.float64)
+                score = float(selected_pose["final_score"])
+                if R.shape != (3, 3) or t.shape != (3,):
+                    raise ValueError(
+                        "selected pose must contain R=3x3 and t_mm=3"
+                    )
+                if (
+                    not np.isfinite(R).all()
+                    or not np.isfinite(t).all()
+                    or not np.isfinite(score)
+                ):
+                    raise ValueError("selected pose contains non-finite values")
+                pose = np.eye(4, dtype=np.float64)
+                pose[:3, :3] = R
+                pose[:3, 3] = t
+                image_predictions.append({
+                    "scene_id": scene_id,
+                    "im_id": im_id,
+                    "obj_id": obj_id,
+                    "score": score,
+                    "pose": pose,
+                })
+            target_reports.append({
+                "obj_id": obj_id,
+                "inst_count": target["inst_count"],
+                "selected_count": len(selected),
+                "result": str(target_output),
+            })
+
+        image_time = max(0.0, time.perf_counter() - started)
+        for prediction in image_predictions:
+            prediction["time"] = image_time
+        predictions.extend(image_predictions)
+        image_reports.append({
+            "scene_id": scene_id,
+            "im_id": im_id,
+            "time": image_time,
+            "prediction_count": len(image_predictions),
+            "targets": target_reports,
+        })
+
+    write_bop_csv(output, predictions)
+    return {
+        "dataset": args.dataset,
+        "targets_json": str(targets_json),
+        "processed_image_count": len(image_order),
+        "processed_target_count": processed_target_count,
+        "prediction_count": len(predictions),
+        "max_images": args.max_images,
+        "nms_translation_threshold_mm": float(
+            args.nms_translation_threshold_mm
+        ),
+        "query_cache_dir": str(query_cache_dir),
+        "detection_sources": [
+            str(path) for path in (args.detection_json or [])
+        ],
+        "work_dir": str(work_dir),
+        "output": str(output),
+        "images": image_reports,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FreeZeV2 BOP reproduction utilities")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -814,6 +1007,52 @@ def main() -> None:
     multi.add_argument("--work-dir", type=Path)
     multi.add_argument("--output", type=Path)
 
+    localization = subparsers.add_parser(
+        "run-localization",
+        help="Run multi-mask localization over a BOP target set and write CSV",
+    )
+    localization.add_argument(
+        "--dataset", required=True, choices=sorted(REFERENCE_SUBMISSIONS)
+    )
+    localization.add_argument(
+        "--bop-root", type=Path, default=Path("data/bop")
+    )
+    localization.add_argument("--split", default="test")
+    localization.add_argument(
+        "--query-cache-dir", type=Path, default=Path("outputs/features")
+    )
+    localization.add_argument(
+        "--detection-json", type=Path, action="append"
+    )
+    localization.add_argument("--targets-json", type=Path)
+    localization.add_argument(
+        "--nms-translation-threshold-mm", type=float, required=True
+    )
+    localization.add_argument(
+        "--dinov2-root", type=Path, default=Path("external/dinov2")
+    )
+    localization.add_argument(
+        "--gedi-root", type=Path, default=Path("external/gedi")
+    )
+    localization.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("external/gedi/data/chkpts/3dmatch/chkpt.tar"),
+    )
+    localization.add_argument("--device", default="cuda")
+    localization.add_argument("--grid-size", type=int, default=16)
+    localization.add_argument("--dense-size", type=int, default=3000)
+    localization.add_argument("--top-k", type=int, default=10)
+    localization.add_argument("--iterations", type=int, default=10_000)
+    localization.add_argument("--seed", type=int, default=0)
+    localization.add_argument(
+        "--edge-similarity-threshold", type=float, default=0.9
+    )
+    localization.add_argument("--icp-max-iterations", type=int, default=30)
+    localization.add_argument("--max-images", type=int)
+    localization.add_argument("--work-dir", type=Path)
+    localization.add_argument("--output", type=Path)
+
     args = parser.parse_args()
 
     if args.command == "prepare-data":
@@ -835,6 +1074,11 @@ def main() -> None:
 
     if args.command == "estimate-multi-mask":
         report = _estimate_multi_mask(args)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    if args.command == "run-localization":
+        report = _run_localization(args)
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
