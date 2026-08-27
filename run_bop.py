@@ -340,15 +340,22 @@ def _download_default_masks(dataset: str, output_dir: Path, *, force: bool) -> d
             f"cnos-fastsam_{dataset}_test.json",
             f"cnos-fastsam_{dataset}-test.json",
         }
-        members = [
-            name
-            for name in archive.namelist()
-            if Path(name).name in expected
-        ]
+        uuid_prefixes = (
+            f"cnos-fastsam_{dataset}_test_",
+            f"cnos-fastsam_{dataset}-test_",
+        )
+        members = []
+        for name in archive.namelist():
+            basename = Path(name).name
+            if basename in expected or (
+                basename.endswith(".json")
+                and any(basename.startswith(prefix) for prefix in uuid_prefixes)
+            ):
+                members.append(name)
         if len(members) != 1:
             raise FileNotFoundError(
-                f"expected exactly one {sorted(expected)} member in BOP archive; "
-                f"found {members}"
+                "expected exactly one CNOS/FastSAM JSON for "
+                f"dataset {dataset} in BOP archive; found {members}"
             )
         payload = archive.read(members[0])
     decoded = json.loads(payload.decode("utf-8"))

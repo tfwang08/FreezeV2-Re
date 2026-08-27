@@ -384,7 +384,7 @@ def test_download_default_masks_extracts_expected_member_and_skips_valid_file(
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr(
-            "cnos-fastsam/cnos-fastsam_lmo_test.json",
+            "cnos-fastsam/cnos-fastsam_lmo-test_3cb298ea-e2eb-4713-ae9e-5a7134c5da0f.json",
             payload,
         )
 
