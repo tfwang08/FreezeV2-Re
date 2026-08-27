@@ -1,0 +1,121 @@
+name: Fix default mask archive matching v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-default-mask-download-v2.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix-default-mask-download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[onboard,test]'
+
+      - name: RED - official UUID-suffixed member must fail before fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tests/test_run_bop.py')
+          text = path.read_text()
+          old = '"cnos-fastsam/cnos-fastsam_lmo_test.json",'
+          new = '"cnos-fastsam/cnos-fastsam_lmo-test_3cb298ea-e2eb-4713-ae9e-5a7134c5da0f.json",'
+          if old not in text:
+              raise SystemExit('test fixture anchor not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          set +e
+          pytest -q tests/test_run_bop.py -k download_default_masks > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          if [ "$status" -eq 0 ]; then
+            echo "Expected regression test to fail before production fix"
+            exit 1
+          fi
+          grep -q "expected exactly one" /tmp/red.log
+
+      - name: Fix official UUID-suffixed archive member matching
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('run_bop.py')
+          text = path.read_text()
+          old_lines = [
+              '        expected = {',
+              '            f"cnos-fastsam_{dataset}_test.json",',
+              '            f"cnos-fastsam_{dataset}-test.json",',
+              '        }',
+              '        members = [',
+              '            name',
+              '            for name in archive.namelist()',
+              '            if Path(name).name in expected',
+              '        ]',
+              '        if len(members) != 1:',
+              '            raise FileNotFoundError(',
+              '                f"expected exactly one {sorted(expected)} member in BOP archive; "',
+              '                f"found {members}"',
+              '            )',
+          ]
+          new_lines = [
+              '        expected = {',
+              '            f"cnos-fastsam_{dataset}_test.json",',
+              '            f"cnos-fastsam_{dataset}-test.json",',
+              '        }',
+              '        uuid_prefixes = (',
+              '            f"cnos-fastsam_{dataset}_test_",',
+              '            f"cnos-fastsam_{dataset}-test_",',
+              '        )',
+              '        members = []',
+              '        for name in archive.namelist():',
+              '            basename = Path(name).name',
+              '            if basename in expected or (',
+              '                basename.endswith(".json")',
+              '                and any(basename.startswith(prefix) for prefix in uuid_prefixes)',
+              '            ):',
+              '                members.append(name)',
+              '        if len(members) != 1:',
+              '            raise FileNotFoundError(',
+              '                "expected exactly one CNOS/FastSAM JSON for "',
+              '                f"dataset {dataset} in BOP archive; found {members}"',
+              '            )',
+          ]
+          old = '\n'.join(old_lines) + '\n'
+          new = '\n'.join(new_lines) + '\n'
+          if old not in text:
+              raise SystemExit('download matcher anchor not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: GREEN - regression and full suite
+        run: |
+          python -m py_compile run_bop.py
+          pytest -q tests/test_run_bop.py -k download_default_masks
+          pytest -q
+
+      - name: Commit fix to main
+        run: |
+          rm .github/workflows/fix-default-mask-download.yml
+          rm .github/workflows/fix-default-mask-download-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add run_bop.py tests/test_run_bop.py .github/workflows/fix-default-mask-download.yml .github/workflows/fix-default-mask-download-v2.yml
+          git commit -m "fix: accept official UUID-suffixed mask files"
+          git push origin HEAD:main
