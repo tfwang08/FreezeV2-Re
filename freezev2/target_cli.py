@@ -129,13 +129,9 @@ def extract_target_cache(args, *, dino_cls, gedi_cls) -> dict:
     dense_all, _ = backproject_depth(depth_mm, K, valid_mask)
     if len(dense_all) == 0:
         raise ValueError("mask contains no valid depth pixels")
-    if len(dense_all) < int(args.dense_size):
-        raise ValueError(
-            f"mask has only {len(dense_all)} valid depth points; "
-            f"need {args.dense_size} for the target support cloud"
-        )
     rng = np.random.default_rng(args.seed)
-    dense_ids = rng.choice(len(dense_all), size=int(args.dense_size), replace=False)
+    dense_count = min(int(args.dense_size), len(dense_all))
+    dense_ids = rng.choice(len(dense_all), size=dense_count, replace=False)
     dense_points = np.asarray(dense_all[dense_ids], dtype=np.float32)
 
     (

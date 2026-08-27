@@ -256,3 +256,95 @@ def test_visualize_target_writes_overlay_and_reports_geometry(tmp_path, monkeypa
     np.testing.assert_allclose(report["xyz_min"], [-5.0, -2.0, 400.0])
     np.testing.assert_allclose(report["xyz_max"], [6.0, 3.0, 420.0])
     assert report["output"] == str(output)
+
+def test_extract_target_uses_all_available_dense_points_below_requested_cap(tmp_path):
+    from types import SimpleNamespace
+
+    bop_root = tmp_path / "data" / "bop"
+    scene_dir = bop_root / "lmo" / "test" / "000002"
+    (scene_dir / "rgb").mkdir(parents=True)
+    (scene_dir / "depth").mkdir()
+
+    rgb = np.zeros((32, 32, 3), dtype=np.uint8)
+    depth_raw = np.full((32, 32), 1000, dtype=np.uint16)
+    mask = np.ones((32, 32), dtype=np.uint8) * 255
+    Image.fromarray(rgb).save(scene_dir / "rgb" / "000003.png")
+    Image.fromarray(depth_raw).save(scene_dir / "depth" / "000003.png")
+    mask_path = tmp_path / "mask.png"
+    Image.fromarray(mask).save(mask_path)
+
+    K = [100.0, 0.0, 16.0, 0.0, 100.0, 16.0, 0.0, 0.0, 1.0]
+    (scene_dir / "scene_camera.json").write_text(
+        json.dumps({"3": {"cam_K": K, "depth_scale": 0.1}})
+    )
+
+    query_cache = tmp_path / "query.npz"
+    pca_components = np.zeros((64, 96), dtype=np.float32)
+    pca_components[:, :64] = np.eye(64, dtype=np.float32)
+    np.savez_compressed(
+        query_cache,
+        pca_mean=np.zeros(96, dtype=np.float32),
+        pca_components=pca_components,
+        pca_dim=np.int32(64),
+        diameter=np.float32(100.0),
+        dino_layer=np.int32(30),
+        dino_facet=np.array("token"),
+        dino_model=np.array("dinov2_vitg14"),
+    )
+
+    dinov2_root = tmp_path / "dinov2"
+    gedi_root = tmp_path / "gedi"
+    dinov2_root.mkdir()
+    gedi_root.mkdir()
+    checkpoint = tmp_path / "gedi.tar"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "target.npz"
+    calls = {}
+
+    class FakeDinoExtractor:
+        def __init__(self, *args, **kwargs):
+            self.last_image_hw = None
+
+        def encode(self, image):
+            self.last_image_hw = (224, 224)
+            return np.ones((96, 16, 16), dtype=np.float32)
+
+    class FakeGediExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode(self, pts, cloud, object_diameter):
+            calls["cloud_shape"] = tuple(cloud.shape)
+            return np.ones((len(pts), 64), dtype=np.float32)
+
+    args = SimpleNamespace(
+        dataset="lmo",
+        scene_id=2,
+        im_id=3,
+        obj_id=1,
+        mask=mask_path,
+        bop_root=bop_root,
+        split="test",
+        query_cache=query_cache,
+        dinov2_root=dinov2_root,
+        gedi_root=gedi_root,
+        checkpoint=checkpoint,
+        device="cuda",
+        grid_size=16,
+        dense_size=3000,
+        seed=7,
+        output=output,
+    )
+
+    report = run_bop.extract_target_cache(
+        args,
+        dino_cls=FakeDinoExtractor,
+        gedi_cls=FakeGediExtractor,
+    )
+
+    assert calls["cloud_shape"] == (1024, 3)
+    assert report["dense_points"] == [1024, 3]
+    with np.load(output, allow_pickle=False) as data:
+        assert data["dense_points"].shape == (1024, 3)
+        assert int(data["dense_size_requested"]) == 3000
+        assert int(data["dense_valid_count"]) == 1024
