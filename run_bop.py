@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import sys
+import subprocess
 import time
 import urllib.request
 import zipfile
@@ -15,9 +16,11 @@ import numpy as np
 from freezev2.bop import (
     BOP_TOOLKIT_COMMIT,
     REFERENCE_SUBMISSIONS,
+    build_eval_command,
     download_reference_submission,
     evaluate_reference,
     prepare_bop_dataset,
+    read_bop_csv,
     write_bop_csv,
 )
 from freezev2.features import (
@@ -798,6 +801,43 @@ def _run_localization(args) -> dict:
     }
 
 
+def _evaluate_submission(args) -> dict:
+    if args.num_workers <= 0:
+        raise ValueError("--num-workers must be positive")
+    result_csv = Path(args.result_csv)
+    if not result_csv.is_file():
+        raise FileNotFoundError(f"result CSV not found: {result_csv}")
+
+    read_bop_csv(result_csv)
+    command, env = build_eval_command(
+        args.bop_toolkit,
+        args.bop_root,
+        result_csv,
+        args.eval_root,
+        args.num_workers,
+    )
+    subprocess.run(command, check=True, env=env)
+
+    score_path = (
+        Path(args.eval_root)
+        / result_csv.stem
+        / "scores_bop19.json"
+    )
+    if not score_path.is_file():
+        raise RuntimeError(
+            f"official BOP evaluator did not create {score_path}"
+        )
+    scores = json.loads(score_path.read_text())
+    if not isinstance(scores, dict):
+        raise ValueError(f"BOP scores must contain a JSON object: {score_path}")
+    return {
+        "dataset": args.dataset,
+        "result_csv": str(result_csv),
+        "scores": scores,
+        "output": str(score_path),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FreeZeV2 BOP reproduction utilities")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -831,6 +871,33 @@ def main() -> None:
     evaluate.add_argument("--bop-toolkit", type=Path, default=Path("external/bop_toolkit"))
     evaluate.add_argument("--eval-root", type=Path, default=Path("outputs/bop_eval"))
     evaluate.add_argument("--num-workers", type=int, default=10)
+
+    evaluate_submission = subparsers.add_parser(
+        "evaluate-submission",
+        help="Run the official BOP19 evaluator on a generated result CSV",
+    )
+    evaluate_submission.add_argument(
+        "--dataset",
+        required=True,
+        choices=sorted(REFERENCE_SUBMISSIONS),
+    )
+    evaluate_submission.add_argument("--result-csv", type=Path, required=True)
+    evaluate_submission.add_argument(
+        "--bop-root",
+        type=Path,
+        default=Path("data/bop"),
+    )
+    evaluate_submission.add_argument(
+        "--bop-toolkit",
+        type=Path,
+        default=Path("external/bop_toolkit"),
+    )
+    evaluate_submission.add_argument(
+        "--eval-root",
+        type=Path,
+        default=Path("outputs/bop_eval"),
+    )
+    evaluate_submission.add_argument("--num-workers", type=int, default=10)
 
     visual = subparsers.add_parser(
         "extract-query-visual",
@@ -1076,6 +1143,11 @@ def main() -> None:
             args.output_dir,
             force=args.force,
         )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    if args.command == "evaluate-submission":
+        report = _evaluate_submission(args)
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
