@@ -613,8 +613,8 @@ def test_evaluate_submission_accepts_generated_csv_name_and_returns_scores(
 ):
     result_csv = tmp_path / "freezev2-re_lmo-test.csv"
     result_csv.write_text(
-        "scene_id,im_id,obj_id,score,R,t,time\\n"
-        "1,2,3,0.9,1 0 0 0 1 0 0 0 1,0 0 100,1.5\\n"
+        "scene_id,im_id,obj_id,score,R,t,time\n"
+        "1,2,3,0.9,1 0 0 0 1 0 0 0 1,0 0 100,1.5\n"
     )
     bop_root = tmp_path / "bop"
     bop_toolkit = tmp_path / "bop_toolkit"
