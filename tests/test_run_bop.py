@@ -604,3 +604,94 @@ def test_coarse_cache_persists_similarity_means(tmp_path, monkeypatch):
     with np.load(output, allow_pickle=False) as data:
         assert float(data["top1_similarity_mean"]) == np.mean(candidate_sim[:, 0])
         assert float(data["kth_similarity_mean"]) == np.mean(candidate_sim[:, -1])
+
+
+def test_evaluate_submission_accepts_generated_csv_name_and_returns_scores(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    result_csv = tmp_path / "freezev2-re_lmo-test.csv"
+    result_csv.write_text(
+        "scene_id,im_id,obj_id,score,R,t,time\\n"
+        "1,2,3,0.9,1 0 0 0 1 0 0 0 1,0 0 100,1.5\\n"
+    )
+    bop_root = tmp_path / "bop"
+    bop_toolkit = tmp_path / "bop_toolkit"
+    eval_root = tmp_path / "eval"
+    calls = {}
+
+    def fake_build_eval_command(
+        toolkit,
+        root,
+        result,
+        evaluation_root,
+        num_workers=10,
+    ):
+        calls["build"] = (
+            Path(toolkit),
+            Path(root),
+            Path(result),
+            Path(evaluation_root),
+            num_workers,
+        )
+        return ["fake-bop-evaluator"], {"BOP_PATH": "sentinel"}
+
+    def fake_run(command, check, env):
+        calls["run"] = (command, check, env)
+        score_path = eval_root / result_csv.stem / "scores_bop19.json"
+        score_path.parent.mkdir(parents=True)
+        score_path.write_text(json.dumps({"bop19_average_recall": 0.5}))
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        run_bop,
+        "build_eval_command",
+        fake_build_eval_command,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        run_bop,
+        "subprocess",
+        SimpleNamespace(run=fake_run),
+        raising=False,
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "run_bop.py",
+        "evaluate-submission",
+        "--dataset",
+        "lmo",
+        "--result-csv",
+        str(result_csv),
+        "--bop-root",
+        str(bop_root),
+        "--bop-toolkit",
+        str(bop_toolkit),
+        "--eval-root",
+        str(eval_root),
+        "--num-workers",
+        "3",
+    ])
+
+    run_bop.main()
+    report = json.loads(capsys.readouterr().out)
+
+    assert calls["build"] == (
+        bop_toolkit,
+        bop_root,
+        result_csv,
+        eval_root,
+        3,
+    )
+    assert calls["run"] == (
+        ["fake-bop-evaluator"],
+        True,
+        {"BOP_PATH": "sentinel"},
+    )
+    assert report == {
+        "dataset": "lmo",
+        "result_csv": str(result_csv),
+        "scores": {"bop19_average_recall": 0.5},
+        "output": str(eval_root / result_csv.stem / "scores_bop19.json"),
+    }
